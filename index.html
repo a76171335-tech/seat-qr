@@ -24,6 +24,7 @@
 </head>
 <body class="bg-slate-50 text-slate-900 min-h-screen">
   <div id="app"></div>
+  <div id="modal-root"></div>
 
   <script>
     const STORAGE_STATE_KEY = 'classroom_seat_state_v6';
@@ -82,6 +83,7 @@
     let syncStatus = 'connecting';
     let showQrModal = false;
     let customHostInput = '';
+    let lastRenderedQrUrl = '';
 
     let mqttClients = [];
     let ntfyEventSource = null;
@@ -96,6 +98,13 @@
       try {
         localStorage.setItem(STORAGE_STATE_KEY, JSON.stringify(state));
       } catch (e) {}
+    }
+
+    function updateSyncStatus(nextStatus) {
+      if (syncStatus !== nextStatus) {
+        syncStatus = nextStatus;
+        if (!isStudentMode) renderAdminBoardOnly();
+      }
     }
 
     // 실시간 수신 데이터 병합
@@ -171,7 +180,7 @@
       if (changed) {
         saveStateToLocal();
         if (!isStudentMode) {
-          render();
+          renderAdminBoardOnly();
         }
       }
       return changed;
@@ -225,7 +234,6 @@
         let tempAssigned = [...state.assigned];
         let hasServerEvents = false;
 
-        // 만약 서버에 RESET_STATE가 하나라도 있으면 서버 로그 기준으로 처음부터 재구성하여 충돌 방지
         let foundResetInLog = false;
         for (const line of lines) {
           if (!line) continue;
@@ -273,7 +281,6 @@
                 if (!ev.resetId || ev.resetId === tempResetId || tempResetId === 'init_v6') {
                   if (ev.resetId) tempResetId = ev.resetId;
                   if (ev.totalSeats) tempTotalSeats = ev.totalSeats;
-                  // 선착순 기준으로 이미 배정된 번호나 이름은 무시 (중복 100% 차단)
                   if (!tempAssigned.some(a => a.seat === ev.record.seat || a.name === ev.record.name)) {
                     tempAssigned.push(ev.record);
                   }
@@ -298,11 +305,10 @@
               updatedAt: Date.now()
             };
             saveStateToLocal();
-            if (!isStudentMode) render();
+            if (!isStudentMode) renderAdminBoardOnly();
           }
         }
-        syncStatus = 'connected';
-        if (!isStudentMode) render();
+        updateSyncStatus('connected');
         return true;
       } catch (e) {
         return false;
@@ -320,7 +326,7 @@
         if (e.key === STORAGE_STATE_KEY && e.newValue && !isStudentMode) {
           try {
             state = JSON.parse(e.newValue);
-            render();
+            renderAdminBoardOnly();
           } catch (err) {}
         }
       });
@@ -330,8 +336,7 @@
         try {
           ntfyEventSource = new EventSource(NTFY_URL + '/sse');
           ntfyEventSource.onopen = () => {
-            syncStatus = 'connected';
-            if (!isStudentMode) render();
+            updateSyncStatus('connected');
           };
           ntfyEventSource.onmessage = (event) => {
             try {
@@ -354,10 +359,9 @@
             });
 
             client.on('connect', () => {
-              syncStatus = 'connected';
+              updateSyncStatus('connected');
               client.subscribe(MQTT_TOPIC_STATE, { qos: 1 });
               client.subscribe(MQTT_TOPIC_EVENT, { qos: 1 });
-              if (!isStudentMode) render();
             });
 
             client.on('message', (topic, message) => {
@@ -514,7 +518,7 @@
         updatedAt: Date.now()
       };
       saveStateToLocal();
-      render();
+      renderAdminBoardOnly();
 
       await broadcastPayload({
         type: 'RESET_STATE',
@@ -535,7 +539,7 @@
         updatedAt: Date.now()
       };
       saveStateToLocal();
-      render();
+      renderAdminBoardOnly();
 
       await broadcastPayload({
         type: 'RESET_STATE',
@@ -552,7 +556,7 @@
         state.assigned = state.assigned.filter(item => item.seat !== seatNum);
         state.updatedAt = Date.now();
         saveStateToLocal();
-        render();
+        renderAdminBoardOnly();
 
         await broadcastPayload({
           type: 'UNASSIGN_SEAT',
@@ -572,7 +576,7 @@
         state.assigned = [...state.assigned, record];
         state.updatedAt = Date.now();
         saveStateToLocal();
-        render();
+        renderAdminBoardOnly();
 
         await broadcastPayload({
           type: 'ASSIGN_SEAT',
@@ -583,11 +587,25 @@
       }
     }
 
+    function openQrModal() {
+      showQrModal = true;
+      lastRenderedQrUrl = '';
+      renderQrModalOnly();
+    }
+
+    function closeQrModal() {
+      showQrModal = false;
+      lastRenderedQrUrl = '';
+      renderQrModalOnly();
+    }
+
     function renderQrCode(targetUrl) {
       const container = document.getElementById('qrcode-container');
       if (!container) return;
+      if (lastRenderedQrUrl === targetUrl && container.children.length > 0) return;
       container.innerHTML = '';
       if (!targetUrl) return;
+      lastRenderedQrUrl = targetUrl;
       new QRCode(container, {
         text: targetUrl,
         width: 230,
@@ -691,13 +709,18 @@
       `;
     }
 
-    function renderAdminView() {
+    // 배경 좌석 현황판만 업데이트 (열려있는 QR 모달은 절대 건드리지 않음)
+    function renderAdminBoardOnly() {
       const app = document.getElementById('app');
       const assignedMap = new Map(state.assigned.map(item => [item.seat, item]));
       const assignedCount = state.assigned.length;
       const remainingCount = Math.max(0, state.totalSeats - assignedCount);
-      const studentUrl = getStudentJoinUrl(customHostInput);
-      const isLocalOrPreview = !(window.location.protocol === 'http:' || window.location.protocol === 'https:');
+
+      // 현재 입력창에 포커스가 있다면 입력 중인 값 보존
+      const activeInput = document.getElementById('seatCountInput');
+      const currentInputVal = (activeInput && document.activeElement === activeInput)
+        ? activeInput.value
+        : state.totalSeats;
 
       let seatsHtml = '';
       for (let i = 1; i <= state.totalSeats; i++) {
@@ -742,7 +765,7 @@
             </div>
 
             <div class="flex flex-wrap items-center gap-2.5">
-              <button onclick="showQrModal = true; render();"
+              <button onclick="openQrModal()"
                 class="px-4 py-2.5 bg-indigo-600 hover:bg-indigo-700 text-white font-semibold rounded-xl shadow-sm transition flex items-center gap-2">
                 <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                   <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4v1m6 11h2m-6 0h-2v4m0-11v3m0 0h.01M12 12h4.01M16 20h4M4 12h4m12 0h.01M5 8h2a1 1 0 001-1V5a1 1 0 00-1-1H5a1 1 0 00-1 1v2a1 1 0 001 1zm12 0h2a1 1 0 001-1V5a1 1 0 00-1-1h-2a1 1 0 00-1 1v2a1 1 0 001 1zM5 20h2a1 1 0 001-1v-2a1 1 0 00-1-1H5a1 1 0 00-1 1v2a1 1 0 001 1z"></path>
@@ -761,7 +784,7 @@
             <div class="lg:col-span-6 bg-white p-5 rounded-2xl border border-slate-200 shadow-sm flex flex-wrap items-center justify-between gap-3">
               <div class="flex items-center gap-3">
                 <label for="seatCountInput" class="font-bold text-slate-700">총 학생 수:</label>
-                <input id="seatCountInput" type="number" min="1" max="100" value="${state.totalSeats}"
+                <input id="seatCountInput" type="number" min="1" max="100" value="${currentInputVal}"
                   class="w-24 px-3 py-2 border border-slate-300 rounded-xl font-bold text-center text-lg focus:outline-none focus:ring-2 focus:ring-indigo-500" />
                 <span class="text-slate-600 font-medium">명</span>
               </div>
@@ -806,57 +829,71 @@
             </div>
           </div>
         </div>
+      `;
+    }
 
-        ${showQrModal ? `
-          <div class="fixed inset-0 bg-slate-900/60 backdrop-blur-sm flex items-center justify-center p-4 z-50">
-            <div class="bg-white rounded-3xl max-w-md w-full p-6 sm:p-8 text-center shadow-2xl animate-pop">
-              <div class="flex justify-between items-center mb-4">
-                <h3 class="text-xl font-extrabold text-slate-900">학생 입장용 QR 코드</h3>
-                <button onclick="showQrModal = false; render();" class="text-slate-400 hover:text-slate-600 text-2xl leading-none">&times;</button>
-              </div>
-              <p class="text-sm text-slate-600 mb-5">태블릿 카메라로 아래 QR 코드를 스캔한 뒤<br/><strong>이름을 입력</strong>하면 중복 없는 자리 번호가 즉시 나옵니다.</p>
+    // QR 모달은 별도 레이어(#modal-root)에서 열릴 때 딱 한 번만 렌더링되어 깜빡임/튕김 원천 차단
+    function renderQrModalOnly() {
+      const modalRoot = document.getElementById('modal-root');
+      if (!modalRoot) return;
 
-              <div class="bg-white p-4 rounded-2xl border-2 border-slate-200 inline-flex items-center justify-center mb-4 min-h-[262px] min-w-[262px]">
-                ${studentUrl
-                  ? `<div id="qrcode-container"></div>`
-                  : `<div class="text-sm text-amber-700 bg-amber-50 p-4 rounded-xl max-w-[240px]">
-                      현재 로컬 파일 환경입니다. 아래에 버셀 배포 주소(https://...)를 입력하면 QR 코드가 생성됩니다.
-                    </div>`
-                }
-              </div>
+      if (!showQrModal) {
+        modalRoot.innerHTML = '';
+        return;
+      }
 
-              ${studentUrl ? `
-                <div class="mb-4">
-                  <div class="text-xs text-slate-400 break-all bg-slate-50 p-2.5 rounded-xl border border-slate-200 mb-2">${studentUrl}</div>
-                  <button onclick="navigator.clipboard.writeText('${studentUrl}'); alert('학생용 접속 주소가 복사되었습니다.');"
-                    class="text-xs font-semibold text-indigo-600 hover:text-indigo-800">
-                    접속 링크 복사하기
-                  </button>
-                </div>
-              ` : ''}
+      const studentUrl = getStudentJoinUrl(customHostInput);
+      const isLocalOrPreview = !(window.location.protocol === 'http:' || window.location.protocol === 'https:');
 
-              ${isLocalOrPreview ? `
-                <div class="text-left bg-slate-50 p-3.5 rounded-xl border border-slate-200 mb-4">
-                  <label class="block text-xs font-bold text-slate-700 mb-1">배포된 웹 주소 입력 (선택)</label>
-                  <div class="flex gap-2">
-                    <input id="customHostInputEl" type="url" placeholder="https://seat-qr.vercel.app" value="${customHostInput}"
-                      class="flex-1 px-3 py-1.5 text-xs border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-indigo-500" />
-                    <button onclick="customHostInput = document.getElementById('customHostInputEl').value; render();"
-                      class="px-3 py-1.5 bg-indigo-600 text-white text-xs font-semibold rounded-lg">적용</button>
-                  </div>
-                </div>
-              ` : ''}
-
-              <button onclick="showQrModal = false; render();"
-                class="w-full py-3 bg-slate-900 hover:bg-slate-800 text-white font-bold rounded-xl transition">
-                닫기
-              </button>
+      modalRoot.innerHTML = `
+        <div class="fixed inset-0 bg-slate-900/60 backdrop-blur-sm flex items-center justify-center p-4 z-50">
+          <div class="bg-white rounded-3xl max-w-md w-full p-6 sm:p-8 text-center shadow-2xl animate-pop">
+            <div class="flex justify-between items-center mb-4">
+              <h3 class="text-xl font-extrabold text-slate-900">학생 입장용 QR 코드</h3>
+              <button onclick="closeQrModal()" class="text-slate-400 hover:text-slate-600 text-2xl leading-none">&times;</button>
             </div>
+            <p class="text-sm text-slate-600 mb-5">태블릿 카메라로 아래 QR 코드를 스캔한 뒤<br/><strong>이름을 입력</strong>하면 중복 없는 자리 번호가 즉시 나옵니다.</p>
+
+            <div class="bg-white p-4 rounded-2xl border-2 border-slate-200 inline-flex items-center justify-center mb-4 min-h-[262px] min-w-[262px]">
+              ${studentUrl
+                ? `<div id="qrcode-container"></div>`
+                : `<div class="text-sm text-amber-700 bg-amber-50 p-4 rounded-xl max-w-[240px]">
+                    현재 로컬 파일 환경입니다. 아래에 버셀 배포 주소(https://...)를 입력하면 QR 코드가 생성됩니다.
+                  </div>`
+              }
+            </div>
+
+            ${studentUrl ? `
+              <div class="mb-4">
+                <div class="text-xs text-slate-400 break-all bg-slate-50 p-2.5 rounded-xl border border-slate-200 mb-2">${studentUrl}</div>
+                <button onclick="navigator.clipboard.writeText('${studentUrl}'); alert('학생용 접속 주소가 복사되었습니다.');"
+                  class="text-xs font-semibold text-indigo-600 hover:text-indigo-800">
+                  접속 링크 복사하기
+                </button>
+              </div>
+            ` : ''}
+
+            ${isLocalOrPreview ? `
+              <div class="text-left bg-slate-50 p-3.5 rounded-xl border border-slate-200 mb-4">
+                <label class="block text-xs font-bold text-slate-700 mb-1">배포된 웹 주소 입력 (선택)</label>
+                <div class="flex gap-2">
+                  <input id="customHostInputEl" type="url" placeholder="https://seat-qr.vercel.app" value="${customHostInput}"
+                    class="flex-1 px-3 py-1.5 text-xs border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-indigo-500" />
+                  <button onclick="customHostInput = document.getElementById('customHostInputEl').value; lastRenderedQrUrl = ''; renderQrModalOnly();"
+                    class="px-3 py-1.5 bg-indigo-600 text-white text-xs font-semibold rounded-lg">적용</button>
+                </div>
+              </div>
+            ` : ''}
+
+            <button onclick="closeQrModal()"
+              class="w-full py-3 bg-slate-900 hover:bg-slate-800 text-white font-bold rounded-xl transition">
+              닫기
+            </button>
           </div>
-        ` : ''}
+        </div>
       `;
 
-      if (showQrModal && studentUrl) {
+      if (studentUrl) {
         setTimeout(() => renderQrCode(studentUrl), 0);
       }
     }
@@ -865,7 +902,8 @@
       if (isStudentMode) {
         renderStudentView();
       } else {
-        renderAdminView();
+        renderAdminBoardOnly();
+        renderQrModalOnly();
       }
     }
 
