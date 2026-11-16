@@ -1,0 +1,409 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>학급 자리 배치 QR 시스템</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></script>
+  <style>
+    @import url('https://cdn.jsdelivr.net/gh/orioncactus/pretendard/dist/web/static/pretendard.css');
+    body {
+      font-family: 'Pretendard', -apple-system, BlinkMacSystemFont, system-ui, Roboto, sans-serif;
+    }
+    @keyframes popIn {
+      0% { transform: scale(0.8); opacity: 0; }
+      70% { transform: scale(1.05); opacity: 1; }
+      100% { transform: scale(1); opacity: 1; }
+    }
+    .animate-pop {
+      animation: popIn 0.45s cubic-bezier(0.16, 1, 0.3, 1) forwards;
+    }
+  </style>
+</head>
+<body class="bg-slate-50 text-slate-900 min-h-screen">
+  <div id="app"></div>
+
+  <script>
+    // 상태 관리
+    const STORAGE_KEY = 'classroom_seat_qr_v1';
+    const CHANNEL_NAME = 'classroom_seat_qr_sync';
+    const channel = ('BroadcastChannel' in window) ? new BroadcastChannel(CHANNEL_NAME) : null;
+
+    function loadState() {
+      try {
+        const raw = localStorage.getItem(STORAGE_KEY);
+        if (raw) {
+          const parsed = JSON.parse(raw);
+          if (parsed && typeof parsed.totalSeats === 'number' && Array.isArray(parsed.assigned)) {
+            return parsed;
+          }
+        }
+      } catch (e) {}
+      return {
+        totalSeats: 24,
+        assigned: [] // [{ seat: 3, time: '08:45:12' }]
+      };
+    }
+
+    let state = loadState();
+
+    function saveState(newState, broadcast = true) {
+      state = newState;
+      try {
+        localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
+      } catch (e) {}
+      if (broadcast && channel) {
+        channel.postMessage({ type: 'SYNC_STATE', state });
+      }
+      render();
+    }
+
+    if (channel) {
+      channel.onmessage = (event) => {
+        if (event.data && event.data.type === 'SYNC_STATE') {
+          state = event.data.state;
+          render();
+        }
+      };
+    }
+
+    window.addEventListener('storage', (e) => {
+      if (e.key === STORAGE_KEY && e.newValue) {
+        try {
+          state = JSON.parse(e.newValue);
+          render();
+        } catch (err) {}
+      }
+    });
+
+    // URL 및 모드 판별
+    const urlParams = new URLSearchParams(window.location.search);
+    const isStudentMode = urlParams.get('mode') === 'student';
+
+    // 표준 HTTP/HTTPS URL 정규화
+    function getStudentJoinUrl(customBaseUrl = '') {
+      let base = (customBaseUrl || '').trim();
+      if (!base) {
+        const { protocol, host, pathname } = window.location;
+        if (protocol === 'http:' || protocol === 'https:') {
+          base = `${protocol}//${host}${pathname}`;
+        }
+      }
+      if (!base) return '';
+      try {
+        const u = new URL(base);
+        u.search = '';
+        u.hash = '';
+        u.searchParams.set('mode', 'student');
+        return u.toString();
+      } catch (e) {
+        return '';
+      }
+    }
+
+    // 학생 추첨 상태
+    let studentDrawResult = null; // null | { status: 'drawn', seat: number, time: string } | { status: 'full' }
+    let showQrModal = false;
+    let customHostInput = '';
+
+    function formatTime(date = new Date()) {
+      return date.toTimeString().split(' ')[0];
+    }
+
+    // 중복 없는 자리 추첨
+    function drawRandomSeat() {
+      const assignedSet = new Set(state.assigned.map(item => item.seat));
+      const available = [];
+      for (let i = 1; i <= state.totalSeats; i++) {
+        if (!assignedSet.has(i)) {
+          available.push(i);
+        }
+      }
+
+      if (available.length === 0) {
+        studentDrawResult = { status: 'full' };
+        render();
+        return;
+      }
+
+      const randomIndex = Math.floor(Math.random() * available.length);
+      const chosenSeat = available[randomIndex];
+      const nowStr = formatTime();
+
+      const nextAssigned = [...state.assigned, { seat: chosenSeat, time: nowStr }];
+      studentDrawResult = { status: 'drawn', seat: chosenSeat, time: nowStr };
+      saveState({ ...state, assigned: nextAssigned }, true);
+    }
+
+    // 관리자: 총 학생 수 변경 및 초기화
+    function handleSetTotalSeats(count) {
+      const n = parseInt(count, 10);
+      if (isNaN(n) || n < 1 || n > 100) {
+        alert('1명에서 100명 사이의 숫자를 입력해 주세요.');
+        return;
+      }
+      saveState({ totalSeats: n, assigned: [] }, true);
+    }
+
+    // 관리자: 개별 좌석 수동 토글
+    function toggleSeatManually(seatNum) {
+      const exists = state.assigned.find(item => item.seat === seatNum);
+      let nextAssigned;
+      if (exists) {
+        nextAssigned = state.assigned.filter(item => item.seat !== seatNum);
+      } else {
+        nextAssigned = [...state.assigned, { seat: seatNum, time: formatTime() + ' (수동)' }];
+      }
+      saveState({ ...state, assigned: nextAssigned }, true);
+    }
+
+    // 관리자: 배정 기록만 초기화
+    function resetAssignments() {
+      if (state.assigned.length === 0) return;
+      if (confirm('모든 자리 배정 기록을 초기화하시겠습니까?')) {
+        saveState({ ...state, assigned: [] }, true);
+      }
+    }
+
+    // QR 코드 렌더링
+    function renderQrCode(targetUrl) {
+      const container = document.getElementById('qrcode-container');
+      if (!container) return;
+      container.innerHTML = '';
+      if (!targetUrl) return;
+      new QRCode(container, {
+        text: targetUrl,
+        width: 220,
+        height: 220,
+        colorDark: '#0f172a',
+        colorLight: '#ffffff',
+        correctLevel: QRCode.CorrectLevel.M
+      });
+    }
+
+    function renderStudentView() {
+      if (!studentDrawResult) {
+        drawRandomSeat();
+        return;
+      }
+
+      const app = document.getElementById('app');
+      if (studentDrawResult.status === 'full') {
+        app.innerHTML = `
+          <div class="min-h-screen flex flex-col items-center justify-center p-6 bg-slate-100">
+            <div class="bg-white rounded-3xl shadow-xl p-8 max-w-md w-full text-center border border-slate-200 animate-pop">
+              <div class="w-16 h-16 bg-rose-100 text-rose-600 rounded-full flex items-center justify-center mx-auto mb-4 text-3xl font-bold">!</div>
+              <h1 class="text-2xl font-bold text-slate-900 mb-2">남은 자리가 없습니다</h1>
+              <p class="text-slate-600 mb-6">모든 좌석(${state.totalSeats}번까지)이 이미 배정되었습니다. 선생님께 문의해 주세요.</p>
+              <button onclick="studentDrawResult = null; render();" class="w-full py-3.5 bg-slate-800 hover:bg-slate-900 text-white font-semibold rounded-xl transition">
+                다시 확인하기
+              </button>
+            </div>
+          </div>
+        `;
+        return;
+      }
+
+      app.innerHTML = `
+        <div class="min-h-screen flex flex-col items-center justify-center p-6 bg-gradient-to-b from-indigo-50 to-slate-100">
+          <div class="bg-white rounded-3xl shadow-2xl p-8 sm:p-10 max-w-md w-full text-center border border-indigo-100 animate-pop">
+            <span class="inline-block px-3.5 py-1 bg-indigo-100 text-indigo-700 font-semibold text-sm rounded-full mb-4">
+              자리 배정 완료
+            </span>
+            <p class="text-slate-600 text-lg font-medium mb-2">오늘 나의 자리는</p>
+            <div class="my-6 py-8 px-4 bg-indigo-600 rounded-2xl shadow-inner text-white">
+              <div class="text-7xl sm:text-8xl font-extrabold tracking-tight">${studentDrawResult.seat}<span class="text-3xl font-bold ml-1">번</span></div>
+            </div>
+            <p class="text-sm text-slate-400 mb-8">배정 시각: ${studentDrawResult.time}</p>
+            
+            <button onclick="studentDrawResult = null; render();" class="w-full py-4 bg-slate-900 hover:bg-slate-800 active:scale-[0.99] text-white font-bold text-lg rounded-2xl shadow-md transition">
+              확인 완료 (다음 학생 대기)
+            </button>
+            <p class="text-xs text-slate-400 mt-3">공용 태블릿 사용 시 위 버튼을 눌러 다음 친구가 뽑을 수 있게 해주세요.</p>
+          </div>
+        </div>
+      `;
+    }
+
+    function renderAdminView() {
+      const app = document.getElementById('app');
+      const assignedMap = new Map(state.assigned.map(item => [item.seat, item]));
+      const assignedCount = state.assigned.length;
+      const remainingCount = Math.max(0, state.totalSeats - assignedCount);
+      const studentUrl = getStudentJoinUrl(customHostInput);
+      const isLocalOrPreview = !(window.location.protocol === 'http:' || window.location.protocol === 'https:');
+
+      let seatsHtml = '';
+      for (let i = 1; i <= state.totalSeats; i++) {
+        const info = assignedMap.get(i);
+        if (info) {
+          // 뽑힌 자리: 회색으로 변경
+          seatsHtml += `
+            <button onclick="toggleSeatManually(${i})" title="클릭하여 배정 취소"
+              class="group relative flex flex-col items-center justify-center p-4 rounded-2xl bg-slate-200 border-2 border-slate-300 text-slate-500 transition hover:border-slate-400">
+              <span class="text-xs font-semibold px-2 py-0.5 rounded-full bg-slate-300 text-slate-600 mb-1">배정 완료</span>
+              <span class="text-3xl font-extrabold line-through decoration-slate-400">${i}</span>
+              <span class="text-[11px] text-slate-500 mt-1">${info.time}</span>
+            </button>
+          `;
+        } else {
+          // 남은 자리: 흰색/활성 상태
+          seatsHtml += `
+            <button onclick="toggleSeatManually(${i})" title="클릭하여 수동 배정"
+              class="group relative flex flex-col items-center justify-center p-4 rounded-2xl bg-white border-2 border-indigo-100 hover:border-indigo-400 text-slate-800 shadow-sm transition">
+              <span class="text-xs font-semibold px-2 py-0.5 rounded-full bg-indigo-50 text-indigo-600 mb-1">대기 중</span>
+              <span class="text-3xl font-extrabold text-slate-900">${i}</span>
+              <span class="text-[11px] text-slate-400 mt-1">미배정</span>
+            </button>
+          `;
+        }
+      }
+
+      app.innerHTML = `
+        <div class="max-w-6xl mx-auto p-4 sm:p-8">
+          <!-- 상단 헤더 -->
+          <header class="flex flex-col md:flex-row md:items-center md:justify-between gap-4 bg-white p-6 rounded-3xl shadow-sm border border-slate-200 mb-6">
+            <div>
+              <div class="flex items-center gap-2.5">
+                <span class="px-2.5 py-1 bg-indigo-600 text-white text-xs font-bold rounded-lg">교사용 관리자</span>
+                <h1 class="text-2xl font-extrabold text-slate-900">학급 자리 배치 현황판</h1>
+              </div>
+              <p class="text-sm text-slate-500 mt-1">학생이 QR 코드를 찍어 뽑은 자리는 자동으로 회색으로 표시되며 중복 배정되지 않습니다.</p>
+            </div>
+
+            <div class="flex flex-wrap items-center gap-2.5">
+              <button onclick="showQrModal = true; render();"
+                class="px-4 py-2.5 bg-indigo-600 hover:bg-indigo-700 text-white font-semibold rounded-xl shadow-sm transition flex items-center gap-2">
+                <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4v1m6 11h2m-6 0h-2v4m0-11v3m0 0h.01M12 12h4.01M16 20h4M4 12h4m12 0h.01M5 8h2a1 1 0 001-1V5a1 1 0 00-1-1H5a1 1 0 00-1 1v2a1 1 0 001 1zm12 0h2a1 1 0 001-1V5a1 1 0 00-1-1h-2a1 1 0 00-1 1v2a1 1 0 001 1zM5 20h2a1 1 0 001-1v-2a1 1 0 00-1-1H5a1 1 0 00-1 1v2a1 1 0 001 1z"></path>
+                </svg>
+                학생용 QR 코드 크게 보기
+              </button>
+
+              <button onclick="window.open('?mode=student', '_blank')"
+                class="px-4 py-2.5 bg-emerald-600 hover:bg-emerald-700 text-white font-semibold rounded-xl shadow-sm transition">
+                학생 뽑기 테스트
+              </button>
+            </div>
+          </header>
+
+          <!-- 설정 및 통계 바 -->
+          <div class="grid grid-cols-1 lg:grid-cols-12 gap-4 mb-6">
+            <div class="lg:col-span-6 bg-white p-5 rounded-2xl border border-slate-200 shadow-sm flex flex-wrap items-center justify-between gap-3">
+              <div class="flex items-center gap-3">
+                <label for="seatCountInput" class="font-bold text-slate-700">총 학생 수:</label>
+                <input id="seatCountInput" type="number" min="1" max="100" value="${state.totalSeats}"
+                  class="w-24 px-3 py-2 border border-slate-300 rounded-xl font-bold text-center text-lg focus:outline-none focus:ring-2 focus:ring-indigo-500" />
+                <span class="text-slate-600 font-medium">명</span>
+              </div>
+              <div class="flex items-center gap-2">
+                <button onclick="handleSetTotalSeats(document.getElementById('seatCountInput').value)"
+                  class="px-4 py-2 bg-slate-900 hover:bg-slate-800 text-white text-sm font-semibold rounded-xl transition">
+                  인원 적용 및 초기화
+                </button>
+                <button onclick="resetAssignments()"
+                  class="px-3.5 py-2 bg-rose-50 hover:bg-rose-100 text-rose-600 text-sm font-semibold rounded-xl transition">
+                  기록만 초기화
+                </button>
+              </div>
+            </div>
+
+            <div class="lg:col-span-6 grid grid-cols-3 gap-3">
+              <div class="bg-white p-4 rounded-2xl border border-slate-200 shadow-sm text-center">
+                <div class="text-xs font-semibold text-slate-400">전체 좌석</div>
+                <div class="text-2xl font-extrabold text-slate-900 mt-1">${state.totalSeats}석</div>
+              </div>
+              <div class="bg-slate-200/80 p-4 rounded-2xl border border-slate-300 text-center">
+                <div class="text-xs font-semibold text-slate-600">배정 완료 (회색)</div>
+                <div class="text-2xl font-extrabold text-slate-700 mt-1">${assignedCount}명</div>
+              </div>
+              <div class="bg-indigo-50 p-4 rounded-2xl border border-indigo-100 text-center">
+                <div class="text-xs font-semibold text-indigo-600">남은 좌석</div>
+                <div class="text-2xl font-extrabold text-indigo-700 mt-1">${remainingCount}석</div>
+              </div>
+            </div>
+          </div>
+
+          <!-- 좌석 배치 그리드 -->
+          <div class="bg-white p-6 rounded-3xl border border-slate-200 shadow-sm">
+            <div class="flex items-center justify-between mb-4">
+              <h2 class="font-bold text-slate-800">좌석 번호 현황 (클릭 시 수동 배정/취소 가능)</h2>
+              <div class="flex items-center gap-4 text-xs font-medium text-slate-500">
+                <span class="flex items-center gap-1.5"><span class="w-3 h-3 rounded-sm bg-white border border-indigo-300 inline-block"></span>미배정</span>
+                <span class="flex items-center gap-1.5"><span class="w-3 h-3 rounded-sm bg-slate-300 inline-block"></span>배정 완료</span>
+              </div>
+            </div>
+            <div class="grid grid-cols-3 sm:grid-cols-4 md:grid-cols-6 lg:grid-cols-8 gap-3">
+              ${seatsHtml}
+            </div>
+          </div>
+        </div>
+
+        <!-- QR 코드 모달 -->
+        ${showQrModal ? `
+          <div class="fixed inset-0 bg-slate-900/60 backdrop-blur-sm flex items-center justify-center p-4 z-50">
+            <div class="bg-white rounded-3xl max-w-md w-full p-6 sm:p-8 text-center shadow-2xl animate-pop">
+              <div class="flex justify-between items-center mb-4">
+                <h3 class="text-xl font-extrabold text-slate-900">학생 입장용 QR 코드</h3>
+                <button onclick="showQrModal = false; render();" class="text-slate-400 hover:text-slate-600 text-2xl leading-none">&times;</button>
+              </div>
+              <p class="text-sm text-slate-600 mb-5">태블릿 카메라로 아래 QR 코드를 스캔하면<br/>중복 없는 랜덤 자리 번호가 즉시 화면에 표시됩니다.</p>
+
+              <div class="bg-white p-4 rounded-2xl border-2 border-slate-200 inline-flex items-center justify-center mb-4 min-h-[252px] min-w-[252px]">
+                ${studentUrl
+                  ? `<div id="qrcode-container"></div>`
+                  : `<div class="text-sm text-amber-700 bg-amber-50 p-4 rounded-xl max-w-[230px]">
+                      현재 로컬 파일 또는 미리보기 주소입니다.<br/>아래에 웹 배포 주소(https://...)를 입력하면 QR 코드가 즉시 생성됩니다.
+                    </div>`
+                }
+              </div>
+
+              ${studentUrl ? `
+                <div class="mb-4">
+                  <div class="text-xs text-slate-400 break-all bg-slate-50 p-2.5 rounded-xl border border-slate-200 mb-2">${studentUrl}</div>
+                  <button onclick="navigator.clipboard.writeText('${studentUrl}'); alert('학생용 접속 주소가 복사되었습니다.');"
+                    class="text-xs font-semibold text-indigo-600 hover:text-indigo-800">
+                    접속 링크 복사하기
+                  </button>
+                </div>
+              ` : ''}
+
+              ${isLocalOrPreview ? `
+                <div class="text-left bg-slate-50 p-3.5 rounded-xl border border-slate-200 mb-4">
+                  <label class="block text-xs font-bold text-slate-700 mb-1">배포된 웹 주소 입력 (선택)</label>
+                  <div class="flex gap-2">
+                    <input id="customHostInputEl" type="url" placeholder="https://example.netlify.app" value="${customHostInput}"
+                      class="flex-1 px-3 py-1.5 text-xs border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-indigo-500" />
+                    <button onclick="customHostInput = document.getElementById('customHostInputEl').value; render();"
+                      class="px-3 py-1.5 bg-indigo-600 text-white text-xs font-semibold rounded-lg">적용</button>
+                  </div>
+                </div>
+              ` : ''}
+
+              <button onclick="showQrModal = false; render();"
+                class="w-full py-3 bg-slate-900 hover:bg-slate-800 text-white font-bold rounded-xl transition">
+                닫기
+              </button>
+            </div>
+          </div>
+        ` : ''}
+      `;
+
+      if (showQrModal && studentUrl) {
+        setTimeout(() => renderQrCode(studentUrl), 0);
+      }
+    }
+
+    function render() {
+      if (isStudentMode) {
+        renderStudentView();
+      } else {
+        renderAdminView();
+      }
+    }
+
+    render();
+  </script>
+</body>
+</html>
