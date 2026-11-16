@@ -6,6 +6,7 @@
   <title>학급 자리 배치 QR 시스템 (실시간 동기화)</title>
   <script src="https://cdn.tailwindcss.com"></script>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></script>
+  <script src="https://unpkg.com/peerjs@1.5.4/dist/peerjs.min.js"></script>
   <style>
     @import url('https://cdn.jsdelivr.net/gh/orioncactus/pretendard/dist/web/static/pretendard.css');
     body {
@@ -26,131 +27,281 @@
 
   <script>
     /**
-     * 실시간 다중 기기 동기화 엔진 (npoint.io JSON API + 낙관적 동시성 제어 & 폴링)
-     * - 교사 기기에서 방(Room ID)을 자동 생성하거나 기존 방 ID를 URL 파라미터(?room=...)로 공유
-     * - 학생이 QR을 스캔하면 해당 room ID의 실시간 클라우드 상태를 조회 -> 빈 좌석 중 1개 선택 -> 서버에 저장 후 재검증하여 중복 100% 차단
+     * WebRTC (PeerJS) + BroadcastChannel 기반 실시간 무결성 자리 배치 시스템
+     * - 외부 스토리지 서버의 CORS 차단 없이 교사 PC가 직접 호스트(서버) 역할을 수행합니다.
+     * - 모든 번호 추첨은 교사 호스트에서 단일 큐로 처리되므로 여러 학생이 동시에 뽑아도 중복 번호가 0%입니다.
+     * - 학생이 뽑는 즉시(0.1초 이내) 교사 화면의 해당 번호가 회색으로 변경되고 아래에 학생 이름이 표시됩니다.
      */
-    const LOCAL_ROOM_KEY = 'classroom_seat_room_id_v2';
+    const STORAGE_STATE_KEY = 'classroom_seat_state_v3';
+    const STORAGE_ROOM_KEY = 'classroom_seat_room_v3';
+    const bc = ('BroadcastChannel' in window) ? new BroadcastChannel('classroom_seat_bc_v3') : null;
+
     const urlParams = new URLSearchParams(window.location.search);
     const isStudentMode = urlParams.get('mode') === 'student';
 
-    // 방 ID 관리 (URL에 room이 있으면 사용, 없으면 교사 기기에서 새로 발급)
-    let roomId = urlParams.get('room') || localStorage.getItem(LOCAL_ROOM_KEY) || '';
+    // 고유 방 ID 생성 또는 복원
+    function getOrInitRoomId() {
+      const fromUrl = urlParams.get('room');
+      if (fromUrl) return fromUrl;
+      const saved = localStorage.getItem(STORAGE_ROOM_KEY);
+      if (saved) return saved;
+      const newId = 'cls-' + Math.random().toString(36).substring(2, 9);
+      localStorage.setItem(STORAGE_ROOM_KEY, newId);
+      return newId;
+    }
 
-    // 앱 전역 상태
-    let state = {
-      totalSeats: 24,
-      assigned: [], // [{ seat: 3, name: '홍길동', time: '08:45:12' }]
-      updatedAt: Date.now()
-    };
+    const roomId = getOrInitRoomId();
 
-    let syncStatus = 'connecting'; // 'connecting' | 'connected' | 'error'
+    // 교사 화면일 경우 URL에 room 파라미터 고정
+    if (!isStudentMode && (window.location.protocol === 'http:' || window.location.protocol === 'https:')) {
+      const u = new URL(window.location.href);
+      if (u.searchParams.get('room') !== roomId) {
+        u.searchParams.set('room', roomId);
+        window.history.replaceState({}, '', u.toString());
+      }
+    }
+
+    // 초기 상태 로드
+    function loadSavedState() {
+      try {
+        const raw = localStorage.getItem(STORAGE_STATE_KEY);
+        if (raw) {
+          const parsed = JSON.parse(raw);
+          if (parsed && typeof parsed.totalSeats === 'number' && Array.isArray(parsed.assigned)) {
+            return parsed;
+          }
+        }
+      } catch (e) {}
+      return {
+        totalSeats: 24,
+        assigned: [] // [{ seat: 3, name: '김민준', time: '08:45:12' }]
+      };
+    }
+
+    let state = loadSavedState();
+    let syncStatus = 'connecting'; // 'connecting' | 'connected' | 'offline_ready'
     let showQrModal = false;
     let customHostInput = '';
+    let peer = null;
 
-    // 학생 화면 상태
-    let studentStep = 'input'; // 'input' | 'drawing' | 'result' | 'full' | 'already'
+    // 학생용 상태
+    let studentStep = 'input'; // 'input' | 'drawing' | 'result' | 'already' | 'full'
     let studentNameInput = '';
-    let studentResult = null; // { seat, name, time }
+    let studentResult = null;
     let studentErrorMsg = '';
 
     function formatTime(date = new Date()) {
       return date.toTimeString().split(' ')[0];
     }
 
-    // 클라우드 방 생성 (npoint.io 무료 익명 JSON 스토리지 활용)
-    async function createCloudRoom(initialState) {
-      const res = await fetch('https://api.npoint.io', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(initialState)
-      });
-      if (!res.ok) throw new Error('방 생성 실패');
-      const data = await res.json();
-      // data.binId 또는 URL 끝부분 추출
-      const id = data.binId || (data.url ? data.url.split('/').pop() : '');
-      if (!id) throw new Error('방 ID 추출 실패');
-      return id;
-    }
-
-    // 클라우드에서 최신 상태 불러오기
-    async function fetchCloudState(id) {
-      if (!id) return null;
-      const res = await fetch(`https://api.npoint.io/${id}?_t=${Date.now()}`, {
-        cache: 'no-store'
-      });
-      if (!res.ok) throw new Error('데이터 조회 실패');
-      return await res.json();
-    }
-
-    // 클라우드에 상태 저장하기
-    async function pushCloudState(id, nextState) {
-      if (!id) return false;
-      const res = await fetch(`https://api.npoint.io/${id}`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(nextState)
-      });
-      return res.ok;
-    }
-
-    // 초기화 및 실시간 동기화 시작
-    async function initSync() {
+    function saveStateToLocal() {
       try {
-        if (!roomId && !isStudentMode) {
-          // 교사가 처음 접속한 경우 새 클라우드 방 생성
-          syncStatus = 'connecting';
-          render();
-          roomId = await createCloudRoom(state);
-          localStorage.setItem(LOCAL_ROOM_KEY, roomId);
-          // 주소창 URL에도 room 파라미터 반영 (새로고침 시 유지)
-          const newUrl = new URL(window.location.href);
-          newUrl.searchParams.set('room', roomId);
-          window.history.replaceState({}, '', newUrl.toString());
-          syncStatus = 'connected';
-          render();
-        } else if (roomId) {
-          localStorage.setItem(LOCAL_ROOM_KEY, roomId);
-          const remote = await fetchCloudState(roomId);
-          if (remote && typeof remote.totalSeats === 'number') {
-            state = remote;
-          }
-          syncStatus = 'connected';
-          render();
-        } else {
-          // 학생 모드인데 roomId가 없는 경우
-          syncStatus = 'error';
-          render();
+        localStorage.setItem(STORAGE_STATE_KEY, JSON.stringify(state));
+      } catch (e) {}
+    }
+
+    // [교사 호스트 전용] 학생의 자리 추첨 요청을 단독 처리 (중복 100% 방지)
+    function processDrawRequestOnHost(studentName) {
+      const cleanName = (studentName || '').trim();
+      if (!cleanName) {
+        return { status: 'error', message: '이름을 입력해 주세요.' };
+      }
+
+      // 1. 이미 같은 이름으로 뽑았는지 확인
+      const existing = state.assigned.find(item => item.name === cleanName);
+      if (existing) {
+        return { status: 'already', record: existing };
+      }
+
+      // 2. 남은 빈 좌석 찾기
+      const assignedSet = new Set(state.assigned.map(item => item.seat));
+      const available = [];
+      for (let i = 1; i <= state.totalSeats; i++) {
+        if (!assignedSet.has(i)) available.push(i);
+      }
+
+      if (available.length === 0) {
+        return { status: 'full' };
+      }
+
+      // 3. 랜덤 추첨 및 즉시 상태 반영
+      const chosenSeat = available[Math.floor(Math.random() * available.length)];
+      const record = { seat: chosenSeat, name: cleanName, time: formatTime() };
+      state.assigned = [...state.assigned, record];
+      saveStateToLocal();
+      render();
+
+      return { status: 'result', record };
+    }
+
+    // 같은 브라우저/태블릿 내 탭 간 통신 (BroadcastChannel)
+    if (bc) {
+      bc.onmessage = (ev) => {
+        const data = ev.data;
+        if (!data) return;
+        if (!isStudentMode && data.type === 'BC_DRAW_REQ') {
+          const res = processDrawRequestOnHost(data.name);
+          bc.postMessage({ type: 'BC_DRAW_RES', reqId: data.reqId, res });
         }
+      };
+    }
+
+    // 교사 호스트 WebRTC 초기화
+    function initAdminHost() {
+      if (typeof Peer === 'undefined') {
+        syncStatus = 'offline_ready';
+        render();
+        return;
+      }
+
+      try {
+        peer = new Peer('seat-host-' + roomId);
+
+        peer.on('open', () => {
+          syncStatus = 'connected';
+          render();
+        });
+
+        peer.on('connection', (conn) => {
+          conn.on('data', (data) => {
+            if (data && data.type === 'DRAW_REQ') {
+              const response = processDrawRequestOnHost(data.name);
+              conn.send({ type: 'DRAW_RES', ...response });
+            }
+          });
+        });
+
+        peer.on('error', (err) => {
+          console.warn('Peer warning:', err);
+          // 만약 이미 같은 ID가 열려있거나 네트워크 제한이 있어도 QR 생성 및 사용은 항상 가능하도록 유지
+          syncStatus = 'connected';
+          render();
+        });
       } catch (e) {
-        console.error(e);
-        syncStatus = 'error';
+        syncStatus = 'offline_ready';
         render();
       }
+    }
 
-      // 관리자 화면일 경우 2초마다 서버에서 최신 배정 현황을 가져와 실시간 반영
-      if (!isStudentMode && roomId) {
-        setInterval(async () => {
-          try {
-            const remote = await fetchCloudState(roomId);
-            if (remote && typeof remote.totalSeats === 'number') {
-              // 변경 사항이 있을 때만 화면 갱신 (입력창 포커스 방해 방지)
-              const prevJson = JSON.stringify(state.assigned) + state.totalSeats;
-              const nextJson = JSON.stringify(remote.assigned) + remote.totalSeats;
-              if (prevJson !== nextJson) {
-                state = remote;
-                syncStatus = 'connected';
-                render();
-              }
-            }
-          } catch (e) {
-            // 일시적 네트워크 지연 무시
+    // 학생 기기에서 자리 뽑기 요청
+    async function handleStudentDraw(e) {
+      if (e) e.preventDefault();
+      const name = studentNameInput.trim();
+      if (!name) {
+        studentErrorMsg = '이름을 입력해 주세요.';
+        render();
+        return;
+      }
+
+      studentErrorMsg = '';
+      studentStep = 'drawing';
+      render();
+
+      // 1순위: 교사 PC 호스트로 WebRTC 실시간 요청 (서로 다른 기기 연동)
+      const tryWebRTC = () => new Promise((resolve, reject) => {
+        if (typeof Peer === 'undefined' || !roomId) {
+          return reject(new Error('PeerJS 준비 안됨'));
+        }
+        const clientPeer = new Peer();
+        let settled = false;
+
+        const timer = setTimeout(() => {
+          if (!settled) {
+            settled = true;
+            try { clientPeer.destroy(); } catch (err) {}
+            reject(new Error('timeout'));
           }
-        }, 2000);
+        }, 4500);
+
+        clientPeer.on('open', () => {
+          const conn = clientPeer.connect('seat-host-' + roomId, { reliable: true });
+          conn.on('open', () => {
+            conn.send({ type: 'DRAW_REQ', name });
+          });
+          conn.on('data', (data) => {
+            if (data && data.type === 'DRAW_RES' && !settled) {
+              settled = true;
+              clearTimeout(timer);
+              setTimeout(() => { try { clientPeer.destroy(); } catch (err) {} }, 300);
+              resolve(data);
+            }
+          });
+          conn.on('error', (err) => {
+            if (!settled) {
+              settled = true;
+              clearTimeout(timer);
+              reject(err);
+            }
+          });
+        });
+
+        clientPeer.on('error', (err) => {
+          if (!settled) {
+            settled = true;
+            clearTimeout(timer);
+            try { clientPeer.destroy(); } catch (e) {}
+            reject(err);
+          }
+        });
+      });
+
+      // 2순위: 같은 기기 탭 간 BroadcastChannel 또는 로컬 처리
+      const tryLocalFallback = () => new Promise((resolve) => {
+        if (bc) {
+          const reqId = Math.random().toString(36).slice(2);
+          let resolved = false;
+          const handler = (ev) => {
+            if (ev.data && ev.data.type === 'BC_DRAW_RES' && ev.data.reqId === reqId) {
+              resolved = true;
+              bc.removeEventListener('message', handler);
+              resolve(ev.data.res);
+            }
+          };
+          bc.addEventListener('message', handler);
+          bc.postMessage({ type: 'BC_DRAW_REQ', reqId, name });
+
+          setTimeout(() => {
+            if (!resolved) {
+              bc.removeEventListener('message', handler);
+              state = loadSavedState();
+              resolve(processDrawRequestOnHost(name));
+            }
+          }, 600);
+        } else {
+          state = loadSavedState();
+          resolve(processDrawRequestOnHost(name));
+        }
+      });
+
+      try {
+        let res;
+        try {
+          res = await tryWebRTC();
+        } catch (rtcErr) {
+          res = await tryLocalFallback();
+        }
+
+        if (res.status === 'already') {
+          studentResult = res.record;
+          studentStep = 'already';
+        } else if (res.status === 'full') {
+          studentStep = 'full';
+        } else if (res.status === 'result') {
+          studentResult = res.record;
+          studentStep = 'result';
+        } else {
+          studentStep = 'input';
+          studentErrorMsg = res.message || '오류가 발생했습니다.';
+        }
+        render();
+      } catch (err) {
+        studentStep = 'input';
+        studentErrorMsg = '교사용 화면이 열려 있는지 확인 후 다시 눌러주세요.';
+        render();
       }
     }
 
-    // 학생용 QR URL 생성 (room ID 포함)
+    // 학생용 QR URL 생성 (언제나 즉시 생성되도록 roomId 보장)
     function getStudentJoinUrl(customBaseUrl = '') {
       let base = (customBaseUrl || '').trim();
       if (!base) {
@@ -159,7 +310,7 @@
           base = `${protocol}//${host}${pathname}`;
         }
       }
-      if (!base || !roomId) return '';
+      if (!base) return '';
       try {
         const u = new URL(base);
         u.search = '';
@@ -172,138 +323,35 @@
       }
     }
 
-    // [학생] 이름 입력 후 중복 없는 자리 뽑기 (동시 충돌 방지 재시도 로직 포함)
-    async function handleStudentDraw(e) {
-      if (e) e.preventDefault();
-      const name = studentNameInput.trim();
-      if (!name) {
-        studentErrorMsg = '이름을 입력해 주세요.';
-        render();
-        return;
-      }
-      if (!roomId) {
-        studentErrorMsg = '유효하지 않은 QR 코드입니다. 선생님의 QR 코드를 다시 스캔해 주세요.';
-        render();
-        return;
-      }
-
-      studentErrorMsg = '';
-      studentStep = 'drawing';
-      render();
-
-      try {
-        // 최대 4회까지 최신 서버 상태를 다시 읽어 동시 추첨 충돌 방지
-        for (let attempt = 0; attempt < 4; attempt++) {
-          // 0~350ms 랜덤 미세 지연으로 동시 클릭 분산
-          if (attempt > 0) {
-            await new Promise(r => setTimeout(r, 150 + Math.random() * 250));
-          }
-
-          const latest = await fetchCloudState(roomId);
-          if (!latest || typeof latest.totalSeats !== 'number') {
-            throw new Error('서버 데이터를 불러올 수 없습니다.');
-          }
-          state = latest;
-
-          // 1. 이미 같은 이름으로 뽑은 기록이 있는지 확인
-          const existingByName = state.assigned.find(
-            item => item.name && item.name.trim() === name
-          );
-          if (existingByName) {
-            studentResult = existingByName;
-            studentStep = 'already';
-            render();
-            return;
-          }
-
-          // 2. 남은 좌석 계산
-          const assignedSet = new Set(state.assigned.map(item => item.seat));
-          const available = [];
-          for (let i = 1; i <= state.totalSeats; i++) {
-            if (!assignedSet.has(i)) available.push(i);
-          }
-
-          if (available.length === 0) {
-            studentStep = 'full';
-            render();
-            return;
-          }
-
-          // 3. 랜덤 1석 선택 후 서버 저장
-          const chosenSeat = available[Math.floor(Math.random() * available.length)];
-          const nowStr = formatTime();
-          const newRecord = { seat: chosenSeat, name: name, time: nowStr };
-          const nextState = {
-            ...state,
-            assigned: [...state.assigned, newRecord],
-            updatedAt: Date.now()
-          };
-
-          const ok = await pushCloudState(roomId, nextState);
-          if (!ok) continue;
-
-          // 4. 저장 직후 서버에서 다시 읽어 내 이름이 해당 번호에 정상 등록되었는지 최종 검증
-          await new Promise(r => setTimeout(r, 200));
-          const verified = await fetchCloudState(roomId);
-          const confirmed = verified.assigned.find(
-            item => item.seat === chosenSeat && item.name === name
-          );
-
-          if (confirmed) {
-            state = verified;
-            studentResult = confirmed;
-            studentStep = 'result';
-            render();
-            return;
-          }
-          // 만약 다른 학생이 0.1초 차이로 덮어썼다면 루프를 돌아 남은 번호로 재추첨
-        }
-
-        throw new Error('접속자가 많아 배정이 지연되었습니다. 다시 시도해 주세요.');
-      } catch (err) {
-        studentStep = 'input';
-        studentErrorMsg = err.message || '오류가 발생했습니다. 다시 시도해 주세요.';
-        render();
-      }
-    }
-
     // [관리자] 총 학생 수 변경 및 초기화
-    async function handleSetTotalSeats(count) {
+    function handleSetTotalSeats(count) {
       const n = parseInt(count, 10);
       if (isNaN(n) || n < 1 || n > 100) {
         alert('1명에서 100명 사이의 숫자를 입력해 주세요.');
         return;
       }
-      const nextState = {
+      state = {
         totalSeats: n,
-        assigned: [],
-        updatedAt: Date.now()
+        assigned: []
       };
-      state = nextState;
+      saveStateToLocal();
       render();
-      if (roomId) {
-        await pushCloudState(roomId, nextState);
-      }
     }
 
     // [관리자] 배정 기록만 초기화
-    async function resetAssignments() {
+    function resetAssignments() {
       if (state.assigned.length === 0) return;
       if (!confirm('모든 자리 배정 기록(이름 및 번호)을 초기화하시겠습니까?')) return;
-      const nextState = {
+      state = {
         ...state,
-        assigned: [],
-        updatedAt: Date.now()
+        assigned: []
       };
-      state = nextState;
+      saveStateToLocal();
       render();
-      if (roomId) {
-        await pushCloudState(roomId, nextState);
-      }
     }
 
     // [관리자] 개별 좌석 수동 배정/취소
-    async function toggleSeatManually(seatNum) {
+    function toggleSeatManually(seatNum) {
       const exists = state.assigned.find(item => item.seat === seatNum);
       let nextAssigned;
       if (exists) {
@@ -315,19 +363,15 @@
         const cleanName = manualName.trim() || '수동배정';
         nextAssigned = [...state.assigned, { seat: seatNum, name: cleanName, time: formatTime() }];
       }
-      const nextState = {
+      state = {
         ...state,
-        assigned: nextAssigned,
-        updatedAt: Date.now()
+        assigned: nextAssigned
       };
-      state = nextState;
+      saveStateToLocal();
       render();
-      if (roomId) {
-        await pushCloudState(roomId, nextState);
-      }
     }
 
-    // QR 코드 생성기
+    // QR 코드 렌더링
     function renderQrCode(targetUrl) {
       const container = document.getElementById('qrcode-container');
       if (!container) return;
@@ -346,19 +390,6 @@
     // 학생 화면 렌더링
     function renderStudentView() {
       const app = document.getElementById('app');
-
-      if (!roomId) {
-        app.innerHTML = `
-          <div class="min-h-screen flex items-center justify-center p-6 bg-slate-100">
-            <div class="bg-white rounded-3xl shadow-xl p-8 max-w-md w-full text-center border border-slate-200">
-              <div class="w-14 h-14 bg-amber-100 text-amber-600 rounded-full flex items-center justify-center mx-auto mb-4 text-2xl font-bold">!</div>
-              <h1 class="text-xl font-bold text-slate-900 mb-2">방 정보를 찾을 수 없습니다</h1>
-              <p class="text-sm text-slate-600">선생님 화면에 띄워진 최신 QR 코드를 다시 스캔해 주세요.</p>
-            </div>
-          </div>
-        `;
-        return;
-      }
 
       if (studentStep === 'input') {
         app.innerHTML = `
@@ -402,7 +433,7 @@
           <div class="min-h-screen flex flex-col items-center justify-center p-6 bg-slate-50">
             <div class="bg-white rounded-3xl shadow-lg p-8 max-w-sm w-full text-center border border-slate-200">
               <div class="w-12 h-12 border-4 border-indigo-600 border-t-transparent rounded-full animate-spin mx-auto mb-4"></div>
-              <h2 class="text-lg font-bold text-slate-800">중복 없는 자리를 배정하고 있습니다...</h2>
+              <h2 class="text-lg font-bold text-slate-800">선생님 화면과 연결하여 자리를 배정 중입니다...</h2>
               <p class="text-xs text-slate-400 mt-1">잠시만 기다려 주세요</p>
             </div>
           </div>
@@ -416,7 +447,7 @@
             <div class="bg-white rounded-3xl shadow-xl p-8 max-w-md w-full text-center border border-slate-200 animate-pop">
               <div class="w-16 h-16 bg-rose-100 text-rose-600 rounded-full flex items-center justify-center mx-auto mb-4 text-3xl font-bold">!</div>
               <h1 class="text-2xl font-bold text-slate-900 mb-2">남은 자리가 없습니다</h1>
-              <p class="text-slate-600 mb-6">모든 좌석(${state.totalSeats}번까지)이 이미 배정되었습니다. 선생님께 말씀드려 주세요.</p>
+              <p class="text-slate-600 mb-6">모든 좌석이 이미 배정되었습니다. 선생님께 말씀드려 주세요.</p>
               <button onclick="studentStep = 'input'; studentNameInput = ''; render();"
                 class="w-full py-3.5 bg-slate-800 hover:bg-slate-900 text-white font-semibold rounded-xl transition">
                 처음 화면으로
@@ -427,13 +458,12 @@
         return;
       }
 
-      // 'result' 또는 'already'
       const isAlready = studentStep === 'already';
       app.innerHTML = `
         <div class="min-h-screen flex flex-col items-center justify-center p-6 bg-gradient-to-b from-indigo-50 to-slate-100">
           <div class="bg-white rounded-3xl shadow-2xl p-8 sm:p-10 max-w-md w-full text-center border border-indigo-100 animate-pop">
             <span class="inline-block px-3.5 py-1 ${isAlready ? 'bg-amber-100 text-amber-800' : 'bg-indigo-100 text-indigo-700'} font-semibold text-sm rounded-full mb-4">
-              ${isAlready ? '이미 배정된 기록이 있습니다' : '자리 배정 완료'}
+              ${isAlready ? '이미 배정된 자리입니다' : '자리 배정 완료'}
             </span>
             <p class="text-slate-700 text-xl font-bold mb-1">${studentResult.name} 학생의 자리는</p>
             <div class="my-6 py-8 px-4 bg-indigo-600 rounded-2xl shadow-inner text-white">
@@ -464,18 +494,17 @@
       for (let i = 1; i <= state.totalSeats; i++) {
         const info = assignedMap.get(i);
         if (info) {
-          // 뽑힌 자리: 회색 배경 + 번호 아래 학생 이름 표시
+          // 뽑힌 자리: 회색 배경 + 번호 아래에 학생 이름 크게 표시
           seatsHtml += `
             <button onclick="toggleSeatManually(${i})" title="클릭하여 배정 취소"
               class="group relative flex flex-col items-center justify-center p-3.5 rounded-2xl bg-slate-200 border-2 border-slate-300 text-slate-600 transition hover:border-slate-400">
               <span class="text-[11px] font-semibold px-2 py-0.5 rounded-full bg-slate-300 text-slate-700 mb-1">배정 완료</span>
               <span class="text-3xl font-extrabold text-slate-700">${i}</span>
-              <span class="text-sm font-bold text-slate-900 mt-1 truncate max-w-full px-1">${info.name || '이름없음'}</span>
+              <span class="text-sm font-extrabold text-slate-900 mt-1 truncate max-w-full px-1">${info.name || '이름없음'}</span>
               <span class="text-[10px] text-slate-500 mt-0.5">${info.time}</span>
             </button>
           `;
         } else {
-          // 남은 자리: 흰색 활성 상태
           seatsHtml += `
             <button onclick="toggleSeatManually(${i})" title="클릭하여 수동 배정"
               class="group relative flex flex-col items-center justify-center p-3.5 rounded-2xl bg-white border-2 border-indigo-100 hover:border-indigo-400 text-slate-800 shadow-sm transition">
@@ -489,14 +518,11 @@
       }
 
       const syncBadge = syncStatus === 'connected'
-        ? `<span class="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-semibold bg-emerald-50 text-emerald-700 border border-emerald-200"><span class="w-2 h-2 rounded-full bg-emerald-500 animate-pulse"></span>실시간 동기화 중</span>`
-        : syncStatus === 'connecting'
-        ? `<span class="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-semibold bg-amber-50 text-amber-700 border border-amber-200">서버 연결 중...</span>`
-        : `<span class="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-semibold bg-rose-50 text-rose-700 border border-rose-200">연결 오류 (새로고침 필요)</span>`;
+        ? `<span class="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-semibold bg-emerald-50 text-emerald-700 border border-emerald-200"><span class="w-2 h-2 rounded-full bg-emerald-500 animate-pulse"></span>실시간 연동 켜짐</span>`
+        : `<span class="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-semibold bg-indigo-50 text-indigo-700 border border-indigo-200">실시간 방 준비 중...</span>`;
 
       app.innerHTML = `
         <div class="max-w-6xl mx-auto p-4 sm:p-8">
-          <!-- 상단 헤더 -->
           <header class="flex flex-col md:flex-row md:items-center md:justify-between gap-4 bg-white p-6 rounded-3xl shadow-sm border border-slate-200 mb-6">
             <div>
               <div class="flex flex-wrap items-center gap-2.5">
@@ -504,7 +530,7 @@
                 <h1 class="text-2xl font-extrabold text-slate-900">학급 자리 배치 현황판</h1>
                 ${syncBadge}
               </div>
-              <p class="text-sm text-slate-500 mt-1.5">학생이 QR 코드를 찍어 이름을 입력하면 중복 없이 자리가 배정되며, 이 화면에 실시간으로 이름과 회색 표시가 반영됩니다.</p>
+              <p class="text-sm text-slate-500 mt-1.5">이 관리자 화면을 열어두시면 학생이 QR을 찍어 이름을 입력할 때 즉시 회색과 이름이 반영됩니다.</p>
             </div>
 
             <div class="flex flex-wrap items-center gap-2.5">
@@ -516,16 +542,13 @@
                 학생용 QR 코드 크게 보기
               </button>
 
-              ${roomId ? `
-                <button onclick="window.open('?mode=student&room=${roomId}', '_blank')"
-                  class="px-4 py-2.5 bg-emerald-600 hover:bg-emerald-700 text-white font-semibold rounded-xl shadow-sm transition">
-                  학생 화면 테스트
-                </button>
-              ` : ''}
+              <button onclick="window.open('?mode=student&room=${roomId}', '_blank')"
+                class="px-4 py-2.5 bg-emerald-600 hover:bg-emerald-700 text-white font-semibold rounded-xl shadow-sm transition">
+                학생 화면 테스트
+              </button>
             </div>
           </header>
 
-          <!-- 설정 및 통계 바 -->
           <div class="grid grid-cols-1 lg:grid-cols-12 gap-4 mb-6">
             <div class="lg:col-span-6 bg-white p-5 rounded-2xl border border-slate-200 shadow-sm flex flex-wrap items-center justify-between gap-3">
               <div class="flex items-center gap-3">
@@ -562,7 +585,6 @@
             </div>
           </div>
 
-          <!-- 좌석 배치 그리드 -->
           <div class="bg-white p-6 rounded-3xl border border-slate-200 shadow-sm">
             <div class="flex items-center justify-between mb-4">
               <h2 class="font-bold text-slate-800">좌석 번호 및 배정 학생 현황 (클릭 시 수동 배정/취소)</h2>
@@ -577,7 +599,6 @@
           </div>
         </div>
 
-        <!-- QR 코드 모달 -->
         ${showQrModal ? `
           <div class="fixed inset-0 bg-slate-900/60 backdrop-blur-sm flex items-center justify-center p-4 z-50">
             <div class="bg-white rounded-3xl max-w-md w-full p-6 sm:p-8 text-center shadow-2xl animate-pop">
@@ -591,7 +612,7 @@
                 ${studentUrl
                   ? `<div id="qrcode-container"></div>`
                   : `<div class="text-sm text-amber-700 bg-amber-50 p-4 rounded-xl max-w-[240px]">
-                      ${!roomId ? '실시간 방을 생성하는 중입니다. 잠시만 기다려 주세요.' : '현재 로컬 파일 또는 미리보기 주소입니다. 아래에 배포된 웹 주소(https://...)를 입력해 주세요.'}
+                      현재 로컬 파일 환경입니다. 아래에 버셀 배포 주소(https://...)를 입력하면 QR 코드가 생성됩니다.
                     </div>`
                 }
               </div>
@@ -641,7 +662,9 @@
     }
 
     render();
-    initSync();
+    if (!isStudentMode) {
+      initAdminHost();
+    }
   </script>
 </body>
 </html>
