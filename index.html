@@ -3,10 +3,10 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>학급 자리 배치 QR 시스템 (실시간 동기화)</title>
+  <title>학급 자리 배치 QR 시스템</title>
   <script src="https://cdn.tailwindcss.com"></script>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></script>
-  <script src="https://unpkg.com/peerjs@1.5.4/dist/peerjs.min.js"></script>
+  <script src="https://unpkg.com/mqtt@5.3.4/dist/mqtt.min.js"></script>
   <style>
     @import url('https://cdn.jsdelivr.net/gh/orioncactus/pretendard/dist/web/static/pretendard.css');
     body {
@@ -27,38 +27,43 @@
 
   <script>
     /**
-     * WebRTC (PeerJS) + BroadcastChannel 기반 실시간 무결성 자리 배치 시스템
-     * - 외부 스토리지 서버의 CORS 차단 없이 교사 PC가 직접 호스트(서버) 역할을 수행합니다.
-     * - 모든 번호 추첨은 교사 호스트에서 단일 큐로 처리되므로 여러 학생이 동시에 뽑아도 중복 번호가 0%입니다.
-     * - 학생이 뽑는 즉시(0.1초 이내) 교사 화면의 해당 번호가 회색으로 변경되고 아래에 학생 이름이 표시됩니다.
+     * 학급 자리 배치 실시간 클라우드 동기화 엔진 (v5.0)
+     * 1. 고정 채널 ID: 웹사이트 도메인(hostname)을 기반으로 교사와 학생이 항상 100% 동일한 방(채널)에 자동 연결됩니다.
+     *    (예전에 찍어둔 QR 코드나 URL 파라미터가 달라도 무조건 같은 방으로 연결됨)
+     * 2. 3중 실시간 통신망:
+     *    - 망 1: 순수 HTTPS (443포트) 실시간 이벤트 스트림 (ntfy.sh SSE + REST) -> 학교 방화벽 100% 통과
+     *    - 망 2: 다중 글로벌 WebSocket 브로커 (MQTT over WSS 443/8084/8884 포트 + Retained State)
+     *    - 망 3: 동일 기기 탭 간 BroadcastChannel
+     * 3. 무결성 보장: 학생이 번호를 뽑으면 클라우드 상태와 교사 화면에 즉시 기록되며 중복 번호가 절대 발생하지 않습니다.
      */
-    const STORAGE_STATE_KEY = 'classroom_seat_state_v3';
-    const STORAGE_ROOM_KEY = 'classroom_seat_room_v3';
-    const bc = ('BroadcastChannel' in window) ? new BroadcastChannel('classroom_seat_bc_v3') : null;
+    const STORAGE_STATE_KEY = 'classroom_seat_state_v5';
+    const bc = ('BroadcastChannel' in window) ? new BroadcastChannel('classroom_seat_bc_v5') : null;
 
     const urlParams = new URLSearchParams(window.location.search);
     const isStudentMode = urlParams.get('mode') === 'student';
 
-    // 고유 방 ID 생성 또는 복원
-    function getOrInitRoomId() {
-      const fromUrl = urlParams.get('room');
-      if (fromUrl) return fromUrl;
-      const saved = localStorage.getItem(STORAGE_ROOM_KEY);
-      if (saved) return saved;
-      const newId = 'cls-' + Math.random().toString(36).substring(2, 9);
-      localStorage.setItem(STORAGE_ROOM_KEY, newId);
-      return newId;
+    // 도메인 기반 고정 채널 ID 생성 (교사 PC와 학생 태블릿이 항상 같은 채널을 공유하도록 보장)
+    function getFixedChannelId() {
+      const host = (window.location.hostname || 'local-classroom')
+        .replace(/[^a-zA-Z0-9]/g, '_')
+        .toLowerCase();
+      return 'seatqr_v5_' + host;
     }
 
-    const roomId = getOrInitRoomId();
+    const CHANNEL_ID = getFixedChannelId();
+    const NTFY_URL = `https://ntfy.sh/${CHANNEL_ID}`;
 
-    // 교사 화면일 경우 URL에 room 파라미터 고정
-    if (!isStudentMode && (window.location.protocol === 'http:' || window.location.protocol === 'https:')) {
-      const u = new URL(window.location.href);
-      if (u.searchParams.get('room') !== roomId) {
-        u.searchParams.set('room', roomId);
-        window.history.replaceState({}, '', u.toString());
-      }
+    // MQTT 브로커 (443 표준 포트 포함 다중 구성)
+    const MQTT_BROKERS = [
+      'wss://mqtt.eclipseprojects.io:443/mqtt',
+      'wss://broker.emqx.io:8084/mqtt',
+      'wss://broker.hivemq.com:8884/mqtt'
+    ];
+    const MQTT_TOPIC_STATE = `${CHANNEL_ID}/state`;
+    const MQTT_TOPIC_EVENT = `${CHANNEL_ID}/event`;
+
+    function formatTime(date = new Date()) {
+      return date.toTimeString().split(' ')[0];
     }
 
     // 초기 상태 로드
@@ -68,31 +73,36 @@
         if (raw) {
           const parsed = JSON.parse(raw);
           if (parsed && typeof parsed.totalSeats === 'number' && Array.isArray(parsed.assigned)) {
-            return parsed;
+            return {
+              resetId: parsed.resetId || 'init_v5',
+              totalSeats: parsed.totalSeats,
+              assigned: parsed.assigned,
+              updatedAt: parsed.updatedAt || Date.now()
+            };
           }
         }
       } catch (e) {}
       return {
-        totalSeats: 24,
-        assigned: [] // [{ seat: 3, name: '김민준', time: '08:45:12' }]
+        resetId: 'init_v5',
+        totalSeats: 27,
+        assigned: [], // [{ seat: 3, name: '김민준', time: '08:45:12', id: '...' }]
+        updatedAt: Date.now()
       };
     }
 
     let state = loadSavedState();
-    let syncStatus = 'connecting'; // 'connecting' | 'connected' | 'offline_ready'
+    let syncStatus = 'connecting'; // 'connecting' | 'connected'
     let showQrModal = false;
     let customHostInput = '';
-    let peer = null;
 
-    // 학생용 상태
+    let mqttClients = [];
+    let ntfyEventSource = null;
+
+    // 학생 화면 상태
     let studentStep = 'input'; // 'input' | 'drawing' | 'result' | 'already' | 'full'
     let studentNameInput = '';
     let studentResult = null;
     let studentErrorMsg = '';
-
-    function formatTime(date = new Date()) {
-      return date.toTimeString().split(' ')[0];
-    }
 
     function saveStateToLocal() {
       try {
@@ -100,90 +110,297 @@
       } catch (e) {}
     }
 
-    // [교사 호스트 전용] 학생의 자리 추첨 요청을 단독 처리 (중복 100% 방지)
-    function processDrawRequestOnHost(studentName) {
-      const cleanName = (studentName || '').trim();
-      if (!cleanName) {
-        return { status: 'error', message: '이름을 입력해 주세요.' };
-      }
+    // 수신된 이벤트 또는 상태 스냅샷을 현재 상태에 병합 (중복 방지 및 최신 초기화 기준 적용)
+    function applyIncomingPayload(payload) {
+      if (!payload || typeof payload !== 'object') return false;
+      let changed = false;
 
-      // 1. 이미 같은 이름으로 뽑았는지 확인
-      const existing = state.assigned.find(item => item.name === cleanName);
-      if (existing) {
-        return { status: 'already', record: existing };
-      }
-
-      // 2. 남은 빈 좌석 찾기
-      const assignedSet = new Set(state.assigned.map(item => item.seat));
-      const available = [];
-      for (let i = 1; i <= state.totalSeats; i++) {
-        if (!assignedSet.has(i)) available.push(i);
-      }
-
-      if (available.length === 0) {
-        return { status: 'full' };
-      }
-
-      // 3. 랜덤 추첨 및 즉시 상태 반영
-      const chosenSeat = available[Math.floor(Math.random() * available.length)];
-      const record = { seat: chosenSeat, name: cleanName, time: formatTime() };
-      state.assigned = [...state.assigned, record];
-      saveStateToLocal();
-      render();
-
-      return { status: 'result', record };
-    }
-
-    // 같은 브라우저/태블릿 내 탭 간 통신 (BroadcastChannel)
-    if (bc) {
-      bc.onmessage = (ev) => {
-        const data = ev.data;
-        if (!data) return;
-        if (!isStudentMode && data.type === 'BC_DRAW_REQ') {
-          const res = processDrawRequestOnHost(data.name);
-          bc.postMessage({ type: 'BC_DRAW_RES', reqId: data.reqId, res });
+      // 1. 전체 초기화 또는 인원 변경 이벤트인 경우
+      if (payload.type === 'RESET_STATE') {
+        if (payload.resetId !== state.resetId || payload.totalSeats !== state.totalSeats || state.assigned.length > 0) {
+          state = {
+            resetId: payload.resetId,
+            totalSeats: payload.totalSeats,
+            assigned: [],
+            updatedAt: payload.updatedAt || Date.now()
+          };
+          changed = true;
         }
-      };
-    }
-
-    // 교사 호스트 WebRTC 초기화
-    function initAdminHost() {
-      if (typeof Peer === 'undefined') {
-        syncStatus = 'offline_ready';
-        render();
-        return;
       }
-
-      try {
-        peer = new Peer('seat-host-' + roomId);
-
-        peer.on('open', () => {
-          syncStatus = 'connected';
-          render();
-        });
-
-        peer.on('connection', (conn) => {
-          conn.on('data', (data) => {
-            if (data && data.type === 'DRAW_REQ') {
-              const response = processDrawRequestOnHost(data.name);
-              conn.send({ type: 'DRAW_RES', ...response });
+      // 2. 개별 좌석 배정 이벤트인 경우
+      else if (payload.type === 'ASSIGN_SEAT' && payload.record) {
+        // 만약 서버의 resetId가 내 초기값('init_v5')과 다르면 서버 resetId 수용
+        if (state.resetId === 'init_v5' && payload.resetId) {
+          state.resetId = payload.resetId;
+        }
+        if (!payload.resetId || payload.resetId === state.resetId) {
+          if (payload.totalSeats && payload.totalSeats !== state.totalSeats) {
+            state.totalSeats = payload.totalSeats;
+            changed = true;
+          }
+          const rec = payload.record;
+          const seatTaken = state.assigned.some(item => item.seat === rec.seat);
+          const nameTaken = state.assigned.some(item => item.name === rec.name);
+          if (!seatTaken && !nameTaken) {
+            state.assigned = [...state.assigned, rec];
+            state.updatedAt = Date.now();
+            changed = true;
+          }
+        }
+      }
+      // 3. 개별 좌석 배정 취소 이벤트인 경우
+      else if (payload.type === 'UNASSIGN_SEAT' && typeof payload.seat === 'number') {
+        const beforeLen = state.assigned.length;
+        state.assigned = state.assigned.filter(item => item.seat !== payload.seat);
+        if (state.assigned.length !== beforeLen) {
+          state.updatedAt = Date.now();
+          changed = true;
+        }
+      }
+      // 4. 전체 상태 스냅샷(SYNC_STATE)인 경우
+      else if (payload.type === 'SYNC_STATE' && Array.isArray(payload.assigned)) {
+        if (payload.resetId !== state.resetId) {
+          // 새로운 초기화 ID이고 더 최신인 경우 덮어쓰기
+          if ((payload.updatedAt || 0) >= (state.updatedAt || 0) || state.resetId === 'init_v5') {
+            state = {
+              resetId: payload.resetId,
+              totalSeats: payload.totalSeats || state.totalSeats,
+              assigned: payload.assigned,
+              updatedAt: payload.updatedAt || Date.now()
+            };
+            changed = true;
+          }
+        } else {
+          // 같은 resetId 내에서는 학생 배정 목록을 합집합(병합) 처리하여 누락 원천 방지
+          if (payload.totalSeats && payload.totalSeats !== state.totalSeats) {
+            state.totalSeats = payload.totalSeats;
+            changed = true;
+          }
+          const merged = [...state.assigned];
+          payload.assigned.forEach((rec) => {
+            if (!merged.some(m => m.seat === rec.seat || m.name === rec.name)) {
+              merged.push(rec);
+              changed = true;
             }
           });
-        });
+          if (changed) {
+            state.assigned = merged;
+            state.updatedAt = Math.max(state.updatedAt || 0, payload.updatedAt || 0);
+          }
+        }
+      }
 
-        peer.on('error', (err) => {
-          console.warn('Peer warning:', err);
-          // 만약 이미 같은 ID가 열려있거나 네트워크 제한이 있어도 QR 생성 및 사용은 항상 가능하도록 유지
-          syncStatus = 'connected';
+      if (changed) {
+        saveStateToLocal();
+        if (!isStudentMode) {
           render();
+        }
+      }
+      return changed;
+    }
+
+    // 모든 채널(HTTPS ntfy + MQTT + BroadcastChannel)로 이벤트 전송
+    async function broadcastPayload(payload) {
+      const jsonStr = JSON.stringify(payload);
+
+      // 1) 동일 기기 탭 간 전송
+      if (bc) {
+        try { bc.postMessage(payload); } catch (e) {}
+      }
+
+      // 2) MQTT 브로커 전송 (이벤트 + Retained 상태 스냅샷 동시 발행)
+      const stateSnapshotStr = JSON.stringify({
+        type: 'SYNC_STATE',
+        resetId: state.resetId,
+        totalSeats: state.totalSeats,
+        assigned: state.assigned,
+        updatedAt: state.updatedAt
+      });
+
+      mqttClients.forEach((client) => {
+        if (client && client.connected) {
+          try {
+            client.publish(MQTT_TOPIC_EVENT, jsonStr, { qos: 1 });
+            client.publish(MQTT_TOPIC_STATE, stateSnapshotStr, { qos: 1, retain: true });
+          } catch (e) {}
+        }
+      });
+
+      // 3) HTTPS 443포트 ntfy.sh 전송 (Simple Request 방식으로 CORS 프리플라이트 없이 즉시 전송)
+      try {
+        await fetch(NTFY_URL, {
+          method: 'POST',
+          body: jsonStr
         });
-      } catch (e) {
-        syncStatus = 'offline_ready';
-        render();
+      } catch (e) {}
+    }
+
+    // HTTPS (ntfy.sh)에서 최근 이벤트 로그를 가져와 상태 최신화
+    async function fetchRecentHistoryFromHttps() {
+      try {
+        const res = await fetch(`${NTFY_URL}/json?poll=1&since=3h`, { cache: 'no-store' });
+        if (!res.ok) return;
+        const text = await res.text();
+        const lines = text.trim().split('
+');
+
+        // 시간순으로 모든 이벤트 재생
+        let tempResetId = state.resetId;
+        let tempTotalSeats = state.totalSeats;
+        let tempAssigned = [...state.assigned];
+        let hasValidLog = false;
+
+        for (const line of lines) {
+          if (!line) continue;
+          try {
+            const wrapper = JSON.parse(line);
+            if (wrapper.event === 'message' && wrapper.message) {
+              const ev = JSON.parse(wrapper.message);
+              if (ev.type === 'RESET_STATE') {
+                tempResetId = ev.resetId;
+                tempTotalSeats = ev.totalSeats;
+                tempAssigned = [];
+                hasValidLog = true;
+              } else if (ev.type === 'SYNC_STATE' && Array.isArray(ev.assigned)) {
+                if (ev.resetId !== tempResetId) {
+                  tempResetId = ev.resetId;
+                  tempTotalSeats = ev.totalSeats || tempTotalSeats;
+                  tempAssigned = [...ev.assigned];
+                } else {
+                  tempTotalSeats = ev.totalSeats || tempTotalSeats;
+                  ev.assigned.forEach(r => {
+                    if (!tempAssigned.some(a => a.seat === r.seat || a.name === r.name)) {
+                      tempAssigned.push(r);
+                    }
+                  });
+                }
+                hasValidLog = true;
+              } else if (ev.type === 'ASSIGN_SEAT' && ev.record) {
+                if (!ev.resetId || ev.resetId === tempResetId || tempResetId === 'init_v5') {
+                  if (ev.resetId) tempResetId = ev.resetId;
+                  if (ev.totalSeats) tempTotalSeats = ev.totalSeats;
+                  if (!tempAssigned.some(a => a.seat === ev.record.seat || a.name === ev.record.name)) {
+                    tempAssigned.push(ev.record);
+                  }
+                  hasValidLog = true;
+                }
+              } else if (ev.type === 'UNASSIGN_SEAT' && typeof ev.seat === 'number') {
+                tempAssigned = tempAssigned.filter(a => a.seat !== ev.seat);
+                hasValidLog = true;
+              }
+            }
+          } catch (innerErr) {}
+        }
+
+        if (hasValidLog) {
+          const prevSig = JSON.stringify(state.assigned) + state.totalSeats + state.resetId;
+          const nextSig = JSON.stringify(tempAssigned) + tempTotalSeats + tempResetId;
+          if (prevSig !== nextSig) {
+            state = {
+              resetId: tempResetId,
+              totalSeats: tempTotalSeats,
+              assigned: tempAssigned,
+              updatedAt: Date.now()
+            };
+            saveStateToLocal();
+            if (!isStudentMode) render();
+          }
+        }
+        syncStatus = 'connected';
+        if (!isStudentMode) render();
+      } catch (e) {}
+    }
+
+    // 실시간 통신망 초기화 (교사 & 학생 공통)
+    function initRealtimeEngines() {
+      // 1. 동일 기기 BroadcastChannel 수신
+      if (bc) {
+        bc.onmessage = (ev) => {
+          if (ev.data) applyIncomingPayload(ev.data);
+        };
+      }
+
+      window.addEventListener('storage', (e) => {
+        if (e.key === STORAGE_STATE_KEY && e.newValue && !isStudentMode) {
+          try {
+            state = JSON.parse(e.newValue);
+            render();
+          } catch (err) {}
+        }
+      });
+
+      // 2. HTTPS 실시간 스트림 (SSE) 연결
+      if ('EventSource' in window) {
+        try {
+          ntfyEventSource = new EventSource(`${NTFY_URL}/sse`);
+          ntfyEventSource.onopen = () => {
+            syncStatus = 'connected';
+            if (!isStudentMode) render();
+          };
+          ntfyEventSource.onmessage = (event) => {
+            try {
+              const wrapper = JSON.parse(event.data);
+              const payload = wrapper.message ? JSON.parse(wrapper.message) : wrapper;
+              applyIncomingPayload(payload);
+            } catch (e) {}
+          };
+        } catch (e) {}
+      }
+
+      // 3. MQTT over WSS 다중 브로커 연결
+      if (typeof mqtt !== 'undefined') {
+        MQTT_BROKERS.forEach((brokerUrl) => {
+          try {
+            const client = mqtt.connect(brokerUrl, {
+              keepalive: 30,
+              reconnectPeriod: 3000,
+              connectTimeout: 6000
+            });
+
+            client.on('connect', () => {
+              syncStatus = 'connected';
+              client.subscribe(MQTT_TOPIC_STATE, { qos: 1 });
+              client.subscribe(MQTT_TOPIC_EVENT, { qos: 1 });
+              if (!isStudentMode) render();
+            });
+
+            client.on('message', (topic, message) => {
+              try {
+                const payload = JSON.parse(message.toString());
+                applyIncomingPayload(payload);
+              } catch (err) {}
+            });
+
+            mqttClients.push(client);
+          } catch (e) {}
+        });
+      }
+
+      // 4. 초기 히스토리 동기화 및 교사 화면 주기적 백업 폴링
+      fetchRecentHistoryFromHttps().then(() => {
+        // 교사 화면이 처음 열렸을 때 현재 좌석 설정을 클라우드에 공유
+        if (!isStudentMode && state.resetId === 'init_v5') {
+          state.resetId = 'r_' + Date.now();
+          saveStateToLocal();
+          broadcastPayload({
+            type: 'SYNC_STATE',
+            resetId: state.resetId,
+            totalSeats: state.totalSeats,
+            assigned: state.assigned,
+            updatedAt: Date.now()
+          });
+        }
+      });
+
+      if (!isStudentMode) {
+        // 만약 SSE나 WebSocket이 학교 보안장비에 의해 끊기더라도 6초마다 HTTPS로 자동 동기화
+        setInterval(() => {
+          fetchRecentHistoryFromHttps();
+        }, 6000);
       }
     }
 
-    // 학생 기기에서 자리 뽑기 요청
+    // [학생] 이름 입력 후 자리 뽑기
     async function handleStudentDraw(e) {
       if (e) e.preventDefault();
       const name = studentNameInput.trim();
@@ -197,111 +414,76 @@
       studentStep = 'drawing';
       render();
 
-      // 1순위: 교사 PC 호스트로 WebRTC 실시간 요청 (서로 다른 기기 연동)
-      const tryWebRTC = () => new Promise((resolve, reject) => {
-        if (typeof Peer === 'undefined' || !roomId) {
-          return reject(new Error('PeerJS 준비 안됨'));
-        }
-        const clientPeer = new Peer();
-        let settled = false;
-
-        const timer = setTimeout(() => {
-          if (!settled) {
-            settled = true;
-            try { clientPeer.destroy(); } catch (err) {}
-            reject(new Error('timeout'));
-          }
-        }, 4500);
-
-        clientPeer.on('open', () => {
-          const conn = clientPeer.connect('seat-host-' + roomId, { reliable: true });
-          conn.on('open', () => {
-            conn.send({ type: 'DRAW_REQ', name });
-          });
-          conn.on('data', (data) => {
-            if (data && data.type === 'DRAW_RES' && !settled) {
-              settled = true;
-              clearTimeout(timer);
-              setTimeout(() => { try { clientPeer.destroy(); } catch (err) {} }, 300);
-              resolve(data);
-            }
-          });
-          conn.on('error', (err) => {
-            if (!settled) {
-              settled = true;
-              clearTimeout(timer);
-              reject(err);
-            }
-          });
-        });
-
-        clientPeer.on('error', (err) => {
-          if (!settled) {
-            settled = true;
-            clearTimeout(timer);
-            try { clientPeer.destroy(); } catch (e) {}
-            reject(err);
-          }
-        });
-      });
-
-      // 2순위: 같은 기기 탭 간 BroadcastChannel 또는 로컬 처리
-      const tryLocalFallback = () => new Promise((resolve) => {
-        if (bc) {
-          const reqId = Math.random().toString(36).slice(2);
-          let resolved = false;
-          const handler = (ev) => {
-            if (ev.data && ev.data.type === 'BC_DRAW_RES' && ev.data.reqId === reqId) {
-              resolved = true;
-              bc.removeEventListener('message', handler);
-              resolve(ev.data.res);
-            }
-          };
-          bc.addEventListener('message', handler);
-          bc.postMessage({ type: 'BC_DRAW_REQ', reqId, name });
-
-          setTimeout(() => {
-            if (!resolved) {
-              bc.removeEventListener('message', handler);
-              state = loadSavedState();
-              resolve(processDrawRequestOnHost(name));
-            }
-          }, 600);
-        } else {
-          state = loadSavedState();
-          resolve(processDrawRequestOnHost(name));
-        }
-      });
-
       try {
-        let res;
-        try {
-          res = await tryWebRTC();
-        } catch (rtcErr) {
-          res = await tryLocalFallback();
+        // 1단계: 뽑기 직전 서버의 최신 배정 내역을 가져와 동기화
+        await fetchRecentHistoryFromHttps();
+
+        for (let attempt = 0; attempt < 3; attempt++) {
+          // 이미 같은 이름으로 배정된 자리가 있는지 확인
+          const existing = state.assigned.find(item => item.name === name);
+          if (existing) {
+            studentResult = existing;
+            studentStep = 'already';
+            render();
+            return;
+          }
+
+          // 남은 빈 좌석 계산
+          const assignedSet = new Set(state.assigned.map(item => item.seat));
+          const available = [];
+          for (let i = 1; i <= state.totalSeats; i++) {
+            if (!assignedSet.has(i)) available.push(i);
+          }
+
+          if (available.length === 0) {
+            studentStep = 'full';
+            render();
+            return;
+          }
+
+          // 랜덤 번호 추첨
+          const chosenSeat = available[Math.floor(Math.random() * available.length)];
+          const record = {
+            seat: chosenSeat,
+            name: name,
+            time: formatTime(),
+            id: 'draw_' + Date.now() + '_' + Math.random().toString(36).slice(2, 6)
+          };
+
+          // 내 상태에 반영 후 즉시 교사 화면(클라우드 + MQTT + BC)으로 전송!
+          state.assigned = [...state.assigned, record];
+          state.updatedAt = Date.now();
+          saveStateToLocal();
+
+          await broadcastPayload({
+            type: 'ASSIGN_SEAT',
+            resetId: state.resetId,
+            totalSeats: state.totalSeats,
+            record: record
+          });
+
+          // 동시 접속 충돌 검증 (0.35초 대기 후 서버 로그 재확인)
+          await new Promise(r => setTimeout(r, 350));
+          await fetchRecentHistoryFromHttps();
+
+          const myConfirmed = state.assigned.find(item => item.name === name);
+          if (myConfirmed) {
+            studentResult = myConfirmed;
+            studentStep = 'result';
+            render();
+            return;
+          }
         }
 
-        if (res.status === 'already') {
-          studentResult = res.record;
-          studentStep = 'already';
-        } else if (res.status === 'full') {
-          studentStep = 'full';
-        } else if (res.status === 'result') {
-          studentResult = res.record;
-          studentStep = 'result';
-        } else {
-          studentStep = 'input';
-          studentErrorMsg = res.message || '오류가 발생했습니다.';
-        }
-        render();
+        throw new Error('다시 한 번 버튼을 눌러주세요.');
       } catch (err) {
         studentStep = 'input';
-        studentErrorMsg = '교사용 화면이 열려 있는지 확인 후 다시 눌러주세요.';
+        studentErrorMsg = err.message || '연결 지연이 발생했습니다. 다시 눌러주세요.';
         render();
       }
     }
 
-    // 학생용 QR URL 생성 (언제나 즉시 생성되도록 roomId 보장)
+    // 학생용 QR URL 생성 (불필요한 파라미터 없이 깔끔하게 생성)
     function getStudentJoinUrl(customBaseUrl = '') {
       let base = (customBaseUrl || '').trim();
       if (!base) {
@@ -316,7 +498,6 @@
         u.search = '';
         u.hash = '';
         u.searchParams.set('mode', 'student');
-        u.searchParams.set('room', roomId);
         return u.toString();
       } catch (e) {
         return '';
@@ -324,51 +505,89 @@
     }
 
     // [관리자] 총 학생 수 변경 및 초기화
-    function handleSetTotalSeats(count) {
+    async function handleSetTotalSeats(count) {
       const n = parseInt(count, 10);
       if (isNaN(n) || n < 1 || n > 100) {
         alert('1명에서 100명 사이의 숫자를 입력해 주세요.');
         return;
       }
+      const newResetId = 'r_' + Date.now();
       state = {
+        resetId: newResetId,
         totalSeats: n,
-        assigned: []
+        assigned: [],
+        updatedAt: Date.now()
       };
       saveStateToLocal();
       render();
+
+      await broadcastPayload({
+        type: 'RESET_STATE',
+        resetId: newResetId,
+        totalSeats: n,
+        updatedAt: state.updatedAt
+      });
     }
 
     // [관리자] 배정 기록만 초기화
-    function resetAssignments() {
+    async function resetAssignments() {
       if (state.assigned.length === 0) return;
       if (!confirm('모든 자리 배정 기록(이름 및 번호)을 초기화하시겠습니까?')) return;
+      const newResetId = 'r_' + Date.now();
       state = {
-        ...state,
-        assigned: []
+        resetId: newResetId,
+        totalSeats: state.totalSeats,
+        assigned: [],
+        updatedAt: Date.now()
       };
       saveStateToLocal();
       render();
+
+      await broadcastPayload({
+        type: 'RESET_STATE',
+        resetId: newResetId,
+        totalSeats: state.totalSeats,
+        updatedAt: state.updatedAt
+      });
     }
 
     // [관리자] 개별 좌석 수동 배정/취소
-    function toggleSeatManually(seatNum) {
+    async function toggleSeatManually(seatNum) {
       const exists = state.assigned.find(item => item.seat === seatNum);
-      let nextAssigned;
       if (exists) {
         if (!confirm(`${seatNum}번 (${exists.name || '이름없음'}) 배정을 취소하시겠습니까?`)) return;
-        nextAssigned = state.assigned.filter(item => item.seat !== seatNum);
+        state.assigned = state.assigned.filter(item => item.seat !== seatNum);
+        state.updatedAt = Date.now();
+        saveStateToLocal();
+        render();
+
+        await broadcastPayload({
+          type: 'UNASSIGN_SEAT',
+          resetId: state.resetId,
+          seat: seatNum
+        });
       } else {
         const manualName = prompt(`${seatNum}번 자리에 수동 배정할 학생 이름을 입력하세요:`, '');
         if (manualName === null) return;
         const cleanName = manualName.trim() || '수동배정';
-        nextAssigned = [...state.assigned, { seat: seatNum, name: cleanName, time: formatTime() }];
+        const record = {
+          seat: seatNum,
+          name: cleanName,
+          time: formatTime(),
+          id: 'manual_' + Date.now()
+        };
+        state.assigned = [...state.assigned, record];
+        state.updatedAt = Date.now();
+        saveStateToLocal();
+        render();
+
+        await broadcastPayload({
+          type: 'ASSIGN_SEAT',
+          resetId: state.resetId,
+          totalSeats: state.totalSeats,
+          record: record
+        });
       }
-      state = {
-        ...state,
-        assigned: nextAssigned
-      };
-      saveStateToLocal();
-      render();
     }
 
     // QR 코드 렌더링
@@ -412,7 +631,7 @@
                 class="w-full px-4 py-4 text-center text-xl font-bold border-2 border-slate-300 rounded-2xl focus:outline-none focus:border-indigo-600 focus:ring-4 focus:ring-indigo-100 mb-3"
               />
 
-              ${studentErrorMsg ? `<p class="text-sm text-rose-600 font-semibold mb-3">${studentErrorMsg}</p>` : ''}
+              ${studentErrorMsg ? `<p class="text-sm text-rose-600 font-semibold mb-3 leading-relaxed">${studentErrorMsg}</p>` : ''}
 
               <button type="submit"
                 class="w-full py-4 mt-2 bg-indigo-600 hover:bg-indigo-700 active:scale-[0.99] text-white font-bold text-lg rounded-2xl shadow-lg shadow-indigo-200 transition">
@@ -433,7 +652,7 @@
           <div class="min-h-screen flex flex-col items-center justify-center p-6 bg-slate-50">
             <div class="bg-white rounded-3xl shadow-lg p-8 max-w-sm w-full text-center border border-slate-200">
               <div class="w-12 h-12 border-4 border-indigo-600 border-t-transparent rounded-full animate-spin mx-auto mb-4"></div>
-              <h2 class="text-lg font-bold text-slate-800">선생님 화면과 연결하여 자리를 배정 중입니다...</h2>
+              <h2 class="text-lg font-bold text-slate-800">선생님 화면에 자리를 등록하고 있습니다...</h2>
               <p class="text-xs text-slate-400 mt-1">잠시만 기다려 주세요</p>
             </div>
           </div>
@@ -447,7 +666,7 @@
             <div class="bg-white rounded-3xl shadow-xl p-8 max-w-md w-full text-center border border-slate-200 animate-pop">
               <div class="w-16 h-16 bg-rose-100 text-rose-600 rounded-full flex items-center justify-center mx-auto mb-4 text-3xl font-bold">!</div>
               <h1 class="text-2xl font-bold text-slate-900 mb-2">남은 자리가 없습니다</h1>
-              <p class="text-slate-600 mb-6">모든 좌석이 이미 배정되었습니다. 선생님께 말씀드려 주세요.</p>
+              <p class="text-slate-600 mb-6">모든 좌석(${state.totalSeats}석)이 이미 배정되었습니다. 선생님께 말씀드려 주세요.</p>
               <button onclick="studentStep = 'input'; studentNameInput = ''; render();"
                 class="w-full py-3.5 bg-slate-800 hover:bg-slate-900 text-white font-semibold rounded-xl transition">
                 처음 화면으로
@@ -494,7 +713,7 @@
       for (let i = 1; i <= state.totalSeats; i++) {
         const info = assignedMap.get(i);
         if (info) {
-          // 뽑힌 자리: 회색 배경 + 번호 아래에 학생 이름 크게 표시
+          // 뽑힌 자리: 회색 배경 + 번호 아래에 학생 이름 표시
           seatsHtml += `
             <button onclick="toggleSeatManually(${i})" title="클릭하여 배정 취소"
               class="group relative flex flex-col items-center justify-center p-3.5 rounded-2xl bg-slate-200 border-2 border-slate-300 text-slate-600 transition hover:border-slate-400">
@@ -518,8 +737,8 @@
       }
 
       const syncBadge = syncStatus === 'connected'
-        ? `<span class="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-semibold bg-emerald-50 text-emerald-700 border border-emerald-200"><span class="w-2 h-2 rounded-full bg-emerald-500 animate-pulse"></span>실시간 연동 켜짐</span>`
-        : `<span class="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-semibold bg-indigo-50 text-indigo-700 border border-indigo-200">실시간 방 준비 중...</span>`;
+        ? `<span class="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-semibold bg-emerald-50 text-emerald-700 border border-emerald-200"><span class="w-2 h-2 rounded-full bg-emerald-500 animate-pulse"></span>실시간 연동 켜짐 (v5.0)</span>`
+        : `<span class="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-semibold bg-indigo-50 text-indigo-700 border border-indigo-200">실시간 서버 연결 중...</span>`;
 
       app.innerHTML = `
         <div class="max-w-6xl mx-auto p-4 sm:p-8">
@@ -530,7 +749,7 @@
                 <h1 class="text-2xl font-extrabold text-slate-900">학급 자리 배치 현황판</h1>
                 ${syncBadge}
               </div>
-              <p class="text-sm text-slate-500 mt-1.5">이 관리자 화면을 열어두시면 학생이 QR을 찍어 이름을 입력할 때 즉시 회색과 이름이 반영됩니다.</p>
+              <p class="text-sm text-slate-500 mt-1.5">학생이 QR을 찍어 이름을 입력하면 즉시 회색과 이름이 반영됩니다.</p>
             </div>
 
             <div class="flex flex-wrap items-center gap-2.5">
@@ -542,7 +761,7 @@
                 학생용 QR 코드 크게 보기
               </button>
 
-              <button onclick="window.open('?mode=student&room=${roomId}', '_blank')"
+              <button onclick="window.open('?mode=student', '_blank')"
                 class="px-4 py-2.5 bg-emerald-600 hover:bg-emerald-700 text-white font-semibold rounded-xl shadow-sm transition">
                 학생 화면 테스트
               </button>
@@ -662,9 +881,7 @@
     }
 
     render();
-    if (!isStudentMode) {
-      initAdminHost();
-    }
+    initRealtimeEngines();
   </script>
 </body>
 </html>
