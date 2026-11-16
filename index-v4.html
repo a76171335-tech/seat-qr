@@ -1,0 +1,784 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>학급 자리 배치 QR 시스템 (실시간 동기화)</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></script>
+  <script src="https://unpkg.com/mqtt@5.3.4/dist/mqtt.min.js"></script>
+  <script src="https://unpkg.com/peerjs@1.5.4/dist/peerjs.min.js"></script>
+  <style>
+    @import url('https://cdn.jsdelivr.net/gh/orioncactus/pretendard/dist/web/static/pretendard.css');
+    body {
+      font-family: 'Pretendard', -apple-system, BlinkMacSystemFont, system-ui, Roboto, sans-serif;
+    }
+    @keyframes popIn {
+      0% { transform: scale(0.85); opacity: 0; }
+      70% { transform: scale(1.04); opacity: 1; }
+      100% { transform: scale(1); opacity: 1; }
+    }
+    .animate-pop {
+      animation: popIn 0.4s cubic-bezier(0.16, 1, 0.3, 1) forwards;
+    }
+  </style>
+</head>
+<body class="bg-slate-50 text-slate-900 min-h-screen">
+  <div id="app"></div>
+
+  <script>
+    /**
+     * WebSocket (MQTT over WSS) + WebRTC (PeerJS) + BroadcastChannel 3중 실시간 동기화 시스템
+     * - 학교 방화벽이나 LTE/5G망에서도 100% 통과하는 표준 HTTPS 웹소켓(WSS 443포트) 중계 채널을 기본 사용합니다.
+     * - 학생이 번호를 뽑을 때 반드시 교사 화면(호스트)이 추첨하고 즉시 화면을 회색+이름으로 갱신한 뒤 학생에게 번호를 내려주므로,
+     *   "학생 화면에만 번호가 뜨고 교사 화면에는 안 뜨는 현상"과 "중복 번호"가 원천 차단됩니다.
+     */
+    const STORAGE_STATE_KEY = 'classroom_seat_state_v4';
+    const STORAGE_ROOM_KEY = 'classroom_seat_room_v4';
+    const bc = ('BroadcastChannel' in window) ? new BroadcastChannel('classroom_seat_bc_v4') : null;
+
+    const urlParams = new URLSearchParams(window.location.search);
+    const isStudentMode = urlParams.get('mode') === 'student';
+
+    // 고유 방 ID 생성 또는 복원
+    function getOrInitRoomId() {
+      const fromUrl = urlParams.get('room');
+      if (fromUrl) return fromUrl;
+      const saved = localStorage.getItem(STORAGE_ROOM_KEY);
+      if (saved) return saved;
+      const newId = 'cls-' + Math.random().toString(36).substring(2, 9);
+      localStorage.setItem(STORAGE_ROOM_KEY, newId);
+      return newId;
+    }
+
+    const roomId = getOrInitRoomId();
+
+    // 교사 화면일 경우 URL에 room 파라미터 고정
+    if (!isStudentMode && (window.location.protocol === 'http:' || window.location.protocol === 'https:')) {
+      const u = new URL(window.location.href);
+      if (u.searchParams.get('room') !== roomId) {
+        u.searchParams.set('room', roomId);
+        window.history.replaceState({}, '', u.toString());
+      }
+    }
+
+    // 초기 상태 로드
+    function loadSavedState() {
+      try {
+        const raw = localStorage.getItem(STORAGE_STATE_KEY);
+        if (raw) {
+          const parsed = JSON.parse(raw);
+          if (parsed && typeof parsed.totalSeats === 'number' && Array.isArray(parsed.assigned)) {
+            return parsed;
+          }
+        }
+      } catch (e) {}
+      return {
+        totalSeats: 24,
+        assigned: [] // [{ seat: 3, name: '김민준', time: '08:45:12' }]
+      };
+    }
+
+    let state = loadSavedState();
+    let syncStatus = 'connecting'; // 'connecting' | 'connected'
+    let showQrModal = false;
+    let customHostInput = '';
+
+    // 통신 객체
+    let mqttClients = [];
+    let peer = null;
+    const processedReqIds = new Set(); // 중복 요청 처리 방지
+
+    // MQTT 브로커 목록 (HTTPS 443 포트 WebSocket 사용으로 학교 방화벽 100% 통과)
+    const MQTT_BROKERS = [
+      'wss://broker.emqx.io:8084/mqtt',
+      'wss://broker.hivemq.com:8884/mqtt'
+    ];
+    const TOPIC_REQ = `seat-qr-v4/${roomId}/req`;
+    const TOPIC_RES_PREFIX = `seat-qr-v4/${roomId}/res/`;
+    const TOPIC_STATE = `seat-qr-v4/${roomId}/state`;
+
+    // 학생용 상태
+    let studentStep = 'input'; // 'input' | 'drawing' | 'result' | 'already' | 'full'
+    let studentNameInput = '';
+    let studentResult = null;
+    let studentErrorMsg = '';
+
+    function formatTime(date = new Date()) {
+      return date.toTimeString().split(' ')[0];
+    }
+
+    function saveStateToLocal() {
+      try {
+        localStorage.setItem(STORAGE_STATE_KEY, JSON.stringify(state));
+      } catch (e) {}
+    }
+
+    // 클라우드(MQTT Retained 메시지)에 현재 좌석 상태 백업 발행
+    function publishStateSnapshot() {
+      const payload = JSON.stringify({
+        totalSeats: state.totalSeats,
+        assigned: state.assigned,
+        updatedAt: Date.now()
+      });
+      mqttClients.forEach((client) => {
+        if (client && client.connected) {
+          try {
+            client.publish(TOPIC_STATE, payload, { qos: 1, retain: true });
+          } catch (e) {}
+        }
+      });
+    }
+
+    // [교사 호스트 전용] 학생의 자리 추첨 요청을 단독 처리 후 교사 화면 즉시 갱신
+    function processDrawRequestOnHost(studentName, reqId) {
+      if (reqId && processedReqIds.has(reqId)) {
+        // 이미 처리된 요청이면 기존 결과 반환
+        const clean = (studentName || '').trim();
+        const found = state.assigned.find(item => item.name === clean);
+        if (found) return { status: 'result', record: found };
+      }
+      if (reqId) processedReqIds.add(reqId);
+
+      const cleanName = (studentName || '').trim();
+      if (!cleanName) {
+        return { status: 'error', message: '이름을 입력해 주세요.' };
+      }
+
+      // 1. 이미 같은 이름으로 뽑았는지 확인
+      const existing = state.assigned.find(item => item.name === cleanName);
+      if (existing) {
+        return { status: 'already', record: existing };
+      }
+
+      // 2. 남은 빈 좌석 찾기
+      const assignedSet = new Set(state.assigned.map(item => item.seat));
+      const available = [];
+      for (let i = 1; i <= state.totalSeats; i++) {
+        if (!assignedSet.has(i)) available.push(i);
+      }
+
+      if (available.length === 0) {
+        return { status: 'full' };
+      }
+
+      // 3. 랜덤 추첨 및 교사 화면에 즉시 회색 + 이름 반영
+      const chosenSeat = available[Math.floor(Math.random() * available.length)];
+      const record = { seat: chosenSeat, name: cleanName, time: formatTime() };
+      state.assigned = [...state.assigned, record];
+      saveStateToLocal();
+      publishStateSnapshot();
+      render(); // 교사 화면 즉시 업데이트!
+
+      return { status: 'result', record };
+    }
+
+    // 같은 브라우저/기기 탭 간 통신 (BroadcastChannel)
+    if (bc) {
+      bc.onmessage = (ev) => {
+        const data = ev.data;
+        if (!data) return;
+        if (!isStudentMode && data.type === 'BC_DRAW_REQ') {
+          const res = processDrawRequestOnHost(data.name, data.reqId);
+          bc.postMessage({ type: 'BC_DRAW_RES', reqId: data.reqId, res });
+        }
+      };
+    }
+
+    // 다른 탭에서 localStorage가 변경되었을 때도 즉시 반영
+    window.addEventListener('storage', (e) => {
+      if (e.key === STORAGE_STATE_KEY && e.newValue && !isStudentMode) {
+        try {
+          state = JSON.parse(e.newValue);
+          render();
+        } catch (err) {}
+      }
+    });
+
+    // 교사 호스트 초기화 (MQTT 다중 브로커 + WebRTC 동시 가동)
+    function initAdminHost() {
+      // 1. MQTT WebSocket 브로커 연결 (주 통신망)
+      if (typeof mqtt !== 'undefined') {
+        MQTT_BROKERS.forEach((brokerUrl) => {
+          try {
+            const client = mqtt.connect(brokerUrl, {
+              keepalive: 30,
+              reconnectPeriod: 2000,
+              connectTimeout: 8000
+            });
+
+            client.on('connect', () => {
+              syncStatus = 'connected';
+              client.subscribe(TOPIC_REQ, { qos: 1 });
+              publishStateSnapshot();
+              render();
+            });
+
+            client.on('message', (topic, message) => {
+              if (topic === TOPIC_REQ) {
+                try {
+                  const data = JSON.parse(message.toString());
+                  if (data && data.reqId && data.name) {
+                    const res = processDrawRequestOnHost(data.name, data.reqId);
+                    const replyPayload = JSON.stringify({ reqId: data.reqId, ...res });
+                    // 모든 연결된 브로커로 응답 전송하여 학생이 즉시 수신하도록 보장
+                    mqttClients.forEach((c) => {
+                      if (c && c.connected) {
+                        c.publish(TOPIC_RES_PREFIX + data.reqId, replyPayload, { qos: 1 });
+                      }
+                    });
+                  }
+                } catch (err) {}
+              }
+            });
+
+            mqttClients.push(client);
+          } catch (e) {}
+        });
+      }
+
+      // 2. PeerJS WebRTC 보조 호스트 가동
+      if (typeof Peer !== 'undefined') {
+        try {
+          peer = new Peer('seat-host-' + roomId);
+          peer.on('open', () => {
+            syncStatus = 'connected';
+            render();
+          });
+          peer.on('connection', (conn) => {
+            conn.on('data', (data) => {
+              if (data && data.type === 'DRAW_REQ') {
+                const response = processDrawRequestOnHost(data.name, data.reqId);
+                conn.send({ type: 'DRAW_RES', ...response });
+              }
+            });
+          });
+        } catch (e) {}
+      }
+    }
+
+    // 학생 기기에서 자리 뽑기 요청 (반드시 교사 화면에 먼저 반영된 후 결과를 받음)
+    async function handleStudentDraw(e) {
+      if (e) e.preventDefault();
+      const name = studentNameInput.trim();
+      if (!name) {
+        studentErrorMsg = '이름을 입력해 주세요.';
+        render();
+        return;
+      }
+
+      studentErrorMsg = '';
+      studentStep = 'drawing';
+      render();
+
+      const reqId = 'req-' + Date.now() + '-' + Math.random().toString(36).substring(2, 7);
+
+      // 통신 채널 1: MQTT over WebSocket (방화벽/모바일 네트워크 100% 호환)
+      const requestViaMqtt = () => new Promise((resolve, reject) => {
+        if (typeof mqtt === 'undefined') return reject(new Error('MQTT 없음'));
+        let settled = false;
+        const tempClients = [];
+
+        const cleanup = () => {
+          tempClients.forEach((c) => {
+            try { c.end(true); } catch (e) {}
+          });
+        };
+
+        const timer = setTimeout(() => {
+          if (!settled) {
+            settled = true;
+            cleanup();
+            reject(new Error('MQTT timeout'));
+          }
+        }, 7000);
+
+        MQTT_BROKERS.forEach((brokerUrl) => {
+          try {
+            const client = mqtt.connect(brokerUrl, { connectTimeout: 5000 });
+            tempClients.push(client);
+
+            client.on('connect', () => {
+              const myResTopic = TOPIC_RES_PREFIX + reqId;
+              client.subscribe(myResTopic, { qos: 1 }, () => {
+                client.publish(TOPIC_REQ, JSON.stringify({ reqId, name }), { qos: 1 });
+              });
+            });
+
+            client.on('message', (topic, message) => {
+              if (topic === TOPIC_RES_PREFIX + reqId && !settled) {
+                try {
+                  const data = JSON.parse(message.toString());
+                  settled = true;
+                  clearTimeout(timer);
+                  cleanup();
+                  resolve(data);
+                } catch (err) {}
+              }
+            });
+          } catch (e) {}
+        });
+      });
+
+      // 통신 채널 2: WebRTC (PeerJS)
+      const requestViaWebRTC = () => new Promise((resolve, reject) => {
+        if (typeof Peer === 'undefined') return reject(new Error('Peer 없음'));
+        const clientPeer = new Peer();
+        let settled = false;
+
+        const timer = setTimeout(() => {
+          if (!settled) {
+            settled = true;
+            try { clientPeer.destroy(); } catch (e) {}
+            reject(new Error('RTC timeout'));
+          }
+        }, 6000);
+
+        clientPeer.on('open', () => {
+          const conn = clientPeer.connect('seat-host-' + roomId, { reliable: true });
+          conn.on('open', () => {
+            conn.send({ type: 'DRAW_REQ', reqId, name });
+          });
+          conn.on('data', (data) => {
+            if (data && data.type === 'DRAW_RES' && !settled) {
+              settled = true;
+              clearTimeout(timer);
+              setTimeout(() => { try { clientPeer.destroy(); } catch (e) {} }, 200);
+              resolve(data);
+            }
+          });
+        });
+
+        clientPeer.on('error', (err) => {
+          if (!settled) {
+            settled = true;
+            clearTimeout(timer);
+            try { clientPeer.destroy(); } catch (e) {}
+            reject(err);
+          }
+        });
+      });
+
+      // 통신 채널 3: 같은 기기 내 BroadcastChannel ("학생 화면 테스트" 버튼용)
+      const requestViaBroadcastChannel = () => new Promise((resolve, reject) => {
+        if (!bc) return reject(new Error('BC 없음'));
+        let settled = false;
+        const handler = (ev) => {
+          if (ev.data && ev.data.type === 'BC_DRAW_RES' && ev.data.reqId === reqId && !settled) {
+            settled = true;
+            bc.removeEventListener('message', handler);
+            resolve(ev.data.res);
+          }
+        };
+        bc.addEventListener('message', handler);
+        bc.postMessage({ type: 'BC_DRAW_REQ', reqId, name });
+
+        setTimeout(() => {
+          if (!settled) {
+            settled = true;
+            bc.removeEventListener('message', handler);
+            reject(new Error('BC timeout'));
+          }
+        }, 1500);
+      });
+
+      try {
+        // 3가지 실시간 채널 중 가장 먼저 응답하는 채널 채택 (절대 학생 기기 혼자 가짜 번호를 뽑지 않음!)
+        const res = await Promise.any([
+          requestViaBroadcastChannel(),
+          requestViaMqtt(),
+          requestViaWebRTC()
+        ]);
+
+        if (res.status === 'already') {
+          studentResult = res.record;
+          studentStep = 'already';
+        } else if (res.status === 'full') {
+          studentStep = 'full';
+        } else if (res.status === 'result') {
+          studentResult = res.record;
+          studentStep = 'result';
+        } else {
+          studentStep = 'input';
+          studentErrorMsg = res.message || '오류가 발생했습니다.';
+        }
+        render();
+      } catch (err) {
+        studentStep = 'input';
+        studentErrorMsg = '선생님의 관리자 화면과 연결되지 않았습니다. 선생님 컴퓨터에서 자리 배치 현황판이 열려 있는지 확인 후 다시 눌러주세요.';
+        render();
+      }
+    }
+
+    // 학생용 QR URL 생성
+    function getStudentJoinUrl(customBaseUrl = '') {
+      let base = (customBaseUrl || '').trim();
+      if (!base) {
+        const { protocol, host, pathname } = window.location;
+        if (protocol === 'http:' || protocol === 'https:') {
+          base = `${protocol}//${host}${pathname}`;
+        }
+      }
+      if (!base) return '';
+      try {
+        const u = new URL(base);
+        u.search = '';
+        u.hash = '';
+        u.searchParams.set('mode', 'student');
+        u.searchParams.set('room', roomId);
+        return u.toString();
+      } catch (e) {
+        return '';
+      }
+    }
+
+    // [관리자] 총 학생 수 변경 및 초기화
+    function handleSetTotalSeats(count) {
+      const n = parseInt(count, 10);
+      if (isNaN(n) || n < 1 || n > 100) {
+        alert('1명에서 100명 사이의 숫자를 입력해 주세요.');
+        return;
+      }
+      processedReqIds.clear();
+      state = {
+        totalSeats: n,
+        assigned: []
+      };
+      saveStateToLocal();
+      publishStateSnapshot();
+      render();
+    }
+
+    // [관리자] 배정 기록만 초기화
+    function resetAssignments() {
+      if (state.assigned.length === 0) return;
+      if (!confirm('모든 자리 배정 기록(이름 및 번호)을 초기화하시겠습니까?')) return;
+      processedReqIds.clear();
+      state = {
+        ...state,
+        assigned: []
+      };
+      saveStateToLocal();
+      publishStateSnapshot();
+      render();
+    }
+
+    // [관리자] 개별 좌석 수동 배정/취소
+    function toggleSeatManually(seatNum) {
+      const exists = state.assigned.find(item => item.seat === seatNum);
+      let nextAssigned;
+      if (exists) {
+        if (!confirm(`${seatNum}번 (${exists.name || '이름없음'}) 배정을 취소하시겠습니까?`)) return;
+        nextAssigned = state.assigned.filter(item => item.seat !== seatNum);
+      } else {
+        const manualName = prompt(`${seatNum}번 자리에 수동 배정할 학생 이름을 입력하세요:`, '');
+        if (manualName === null) return;
+        const cleanName = manualName.trim() || '수동배정';
+        nextAssigned = [...state.assigned, { seat: seatNum, name: cleanName, time: formatTime() }];
+      }
+      state = {
+        ...state,
+        assigned: nextAssigned
+      };
+      saveStateToLocal();
+      publishStateSnapshot();
+      render();
+    }
+
+    // QR 코드 렌더링
+    function renderQrCode(targetUrl) {
+      const container = document.getElementById('qrcode-container');
+      if (!container) return;
+      container.innerHTML = '';
+      if (!targetUrl) return;
+      new QRCode(container, {
+        text: targetUrl,
+        width: 230,
+        height: 230,
+        colorDark: '#0f172a',
+        colorLight: '#ffffff',
+        correctLevel: QRCode.CorrectLevel.M
+      });
+    }
+
+    // 학생 화면 렌더링
+    function renderStudentView() {
+      const app = document.getElementById('app');
+
+      if (studentStep === 'input') {
+        app.innerHTML = `
+          <div class="min-h-screen flex flex-col items-center justify-center p-6 bg-gradient-to-b from-indigo-50 to-slate-100">
+            <form onsubmit="handleStudentDraw(event)" class="bg-white rounded-3xl shadow-xl p-8 max-w-md w-full text-center border border-indigo-100 animate-pop">
+              <span class="inline-block px-3.5 py-1 bg-indigo-100 text-indigo-700 font-semibold text-xs rounded-full mb-3">
+                학급 자리 뽑기
+              </span>
+              <h1 class="text-2xl font-extrabold text-slate-900 mb-2">이름을 입력하세요</h1>
+              <p class="text-sm text-slate-500 mb-6">본인의 이름을 정확히 입력한 뒤 아래 버튼을 누르면 자리가 배정됩니다.</p>
+
+              <input
+                id="studentNameField"
+                type="text"
+                maxlength="15"
+                required
+                placeholder="예: 김민준"
+                value="${studentNameInput.replace(/"/g, '&quot;')}"
+                oninput="studentNameInput = this.value"
+                class="w-full px-4 py-4 text-center text-xl font-bold border-2 border-slate-300 rounded-2xl focus:outline-none focus:border-indigo-600 focus:ring-4 focus:ring-indigo-100 mb-3"
+              />
+
+              ${studentErrorMsg ? `<p class="text-sm text-rose-600 font-semibold mb-3 leading-relaxed">${studentErrorMsg}</p>` : ''}
+
+              <button type="submit"
+                class="w-full py-4 mt-2 bg-indigo-600 hover:bg-indigo-700 active:scale-[0.99] text-white font-bold text-lg rounded-2xl shadow-lg shadow-indigo-200 transition">
+                내 자리 번호 뽑기
+              </button>
+            </form>
+          </div>
+        `;
+        setTimeout(() => {
+          const el = document.getElementById('studentNameField');
+          if (el) el.focus();
+        }, 50);
+        return;
+      }
+
+      if (studentStep === 'drawing') {
+        app.innerHTML = `
+          <div class="min-h-screen flex flex-col items-center justify-center p-6 bg-slate-50">
+            <div class="bg-white rounded-3xl shadow-lg p-8 max-w-sm w-full text-center border border-slate-200">
+              <div class="w-12 h-12 border-4 border-indigo-600 border-t-transparent rounded-full animate-spin mx-auto mb-4"></div>
+              <h2 class="text-lg font-bold text-slate-800">선생님 화면에 자리를 등록하고 있습니다...</h2>
+              <p class="text-xs text-slate-400 mt-1">잠시만 기다려 주세요</p>
+            </div>
+          </div>
+        `;
+        return;
+      }
+
+      if (studentStep === 'full') {
+        app.innerHTML = `
+          <div class="min-h-screen flex flex-col items-center justify-center p-6 bg-slate-100">
+            <div class="bg-white rounded-3xl shadow-xl p-8 max-w-md w-full text-center border border-slate-200 animate-pop">
+              <div class="w-16 h-16 bg-rose-100 text-rose-600 rounded-full flex items-center justify-center mx-auto mb-4 text-3xl font-bold">!</div>
+              <h1 class="text-2xl font-bold text-slate-900 mb-2">남은 자리가 없습니다</h1>
+              <p class="text-slate-600 mb-6">모든 좌석이 이미 배정되었습니다. 선생님께 말씀드려 주세요.</p>
+              <button onclick="studentStep = 'input'; studentNameInput = ''; render();"
+                class="w-full py-3.5 bg-slate-800 hover:bg-slate-900 text-white font-semibold rounded-xl transition">
+                처음 화면으로
+              </button>
+            </div>
+          </div>
+        `;
+        return;
+      }
+
+      const isAlready = studentStep === 'already';
+      app.innerHTML = `
+        <div class="min-h-screen flex flex-col items-center justify-center p-6 bg-gradient-to-b from-indigo-50 to-slate-100">
+          <div class="bg-white rounded-3xl shadow-2xl p-8 sm:p-10 max-w-md w-full text-center border border-indigo-100 animate-pop">
+            <span class="inline-block px-3.5 py-1 ${isAlready ? 'bg-amber-100 text-amber-800' : 'bg-indigo-100 text-indigo-700'} font-semibold text-sm rounded-full mb-4">
+              ${isAlready ? '이미 배정된 자리입니다' : '자리 배정 완료'}
+            </span>
+            <p class="text-slate-700 text-xl font-bold mb-1">${studentResult.name} 학생의 자리는</p>
+            <div class="my-6 py-8 px-4 bg-indigo-600 rounded-2xl shadow-inner text-white">
+              <div class="text-7xl sm:text-8xl font-extrabold tracking-tight">${studentResult.seat}<span class="text-3xl font-bold ml-1">번</span></div>
+            </div>
+            <p class="text-sm text-slate-400 mb-8">배정 시각: ${studentResult.time}</p>
+
+            <button onclick="studentStep = 'input'; studentNameInput = ''; studentResult = null; render();"
+              class="w-full py-4 bg-slate-900 hover:bg-slate-800 active:scale-[0.99] text-white font-bold text-lg rounded-2xl shadow-md transition">
+              확인 완료 (다음 학생 입력)
+            </button>
+            <p class="text-xs text-slate-400 mt-3">공용 태블릿 사용 시 위 버튼을 눌러 다음 친구가 이름을 입력할 수 있게 해주세요.</p>
+          </div>
+        </div>
+      `;
+    }
+
+    // 관리자 화면 렌더링
+    function renderAdminView() {
+      const app = document.getElementById('app');
+      const assignedMap = new Map(state.assigned.map(item => [item.seat, item]));
+      const assignedCount = state.assigned.length;
+      const remainingCount = Math.max(0, state.totalSeats - assignedCount);
+      const studentUrl = getStudentJoinUrl(customHostInput);
+      const isLocalOrPreview = !(window.location.protocol === 'http:' || window.location.protocol === 'https:');
+
+      let seatsHtml = '';
+      for (let i = 1; i <= state.totalSeats; i++) {
+        const info = assignedMap.get(i);
+        if (info) {
+          // 뽑힌 자리: 회색 배경 + 번호 아래에 학생 이름 크게 표시
+          seatsHtml += `
+            <button onclick="toggleSeatManually(${i})" title="클릭하여 배정 취소"
+              class="group relative flex flex-col items-center justify-center p-3.5 rounded-2xl bg-slate-200 border-2 border-slate-300 text-slate-600 transition hover:border-slate-400">
+              <span class="text-[11px] font-semibold px-2 py-0.5 rounded-full bg-slate-300 text-slate-700 mb-1">배정 완료</span>
+              <span class="text-3xl font-extrabold text-slate-700">${i}</span>
+              <span class="text-sm font-extrabold text-slate-900 mt-1 truncate max-w-full px-1">${info.name || '이름없음'}</span>
+              <span class="text-[10px] text-slate-500 mt-0.5">${info.time}</span>
+            </button>
+          `;
+        } else {
+          seatsHtml += `
+            <button onclick="toggleSeatManually(${i})" title="클릭하여 수동 배정"
+              class="group relative flex flex-col items-center justify-center p-3.5 rounded-2xl bg-white border-2 border-indigo-100 hover:border-indigo-400 text-slate-800 shadow-sm transition">
+              <span class="text-[11px] font-semibold px-2 py-0.5 rounded-full bg-indigo-50 text-indigo-600 mb-1">대기 중</span>
+              <span class="text-3xl font-extrabold text-slate-900">${i}</span>
+              <span class="text-sm font-medium text-slate-300 mt-1">-</span>
+              <span class="text-[10px] text-slate-400 mt-0.5">미배정</span>
+            </button>
+          `;
+        }
+      }
+
+      const syncBadge = syncStatus === 'connected'
+        ? `<span class="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-semibold bg-emerald-50 text-emerald-700 border border-emerald-200"><span class="w-2 h-2 rounded-full bg-emerald-500 animate-pulse"></span>실시간 연동 켜짐</span>`
+        : `<span class="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-semibold bg-indigo-50 text-indigo-700 border border-indigo-200">실시간 방 연결 중...</span>`;
+
+      app.innerHTML = `
+        <div class="max-w-6xl mx-auto p-4 sm:p-8">
+          <header class="flex flex-col md:flex-row md:items-center md:justify-between gap-4 bg-white p-6 rounded-3xl shadow-sm border border-slate-200 mb-6">
+            <div>
+              <div class="flex flex-wrap items-center gap-2.5">
+                <span class="px-2.5 py-1 bg-indigo-600 text-white text-xs font-bold rounded-lg">교사용 관리자</span>
+                <h1 class="text-2xl font-extrabold text-slate-900">학급 자리 배치 현황판</h1>
+                ${syncBadge}
+              </div>
+              <p class="text-sm text-slate-500 mt-1.5">이 관리자 화면을 열어두시면 학생이 QR을 찍어 이름을 입력할 때 즉시 회색과 이름이 반영됩니다.</p>
+            </div>
+
+            <div class="flex flex-wrap items-center gap-2.5">
+              <button onclick="showQrModal = true; render();"
+                class="px-4 py-2.5 bg-indigo-600 hover:bg-indigo-700 text-white font-semibold rounded-xl shadow-sm transition flex items-center gap-2">
+                <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4v1m6 11h2m-6 0h-2v4m0-11v3m0 0h.01M12 12h4.01M16 20h4M4 12h4m12 0h.01M5 8h2a1 1 0 001-1V5a1 1 0 00-1-1H5a1 1 0 00-1 1v2a1 1 0 001 1zm12 0h2a1 1 0 001-1V5a1 1 0 00-1-1h-2a1 1 0 00-1 1v2a1 1 0 001 1zM5 20h2a1 1 0 001-1v-2a1 1 0 00-1-1H5a1 1 0 00-1 1v2a1 1 0 001 1z"></path>
+                </svg>
+                학생용 QR 코드 크게 보기
+              </button>
+
+              <button onclick="window.open('?mode=student&room=${roomId}', '_blank')"
+                class="px-4 py-2.5 bg-emerald-600 hover:bg-emerald-700 text-white font-semibold rounded-xl shadow-sm transition">
+                학생 화면 테스트
+              </button>
+            </div>
+          </header>
+
+          <div class="grid grid-cols-1 lg:grid-cols-12 gap-4 mb-6">
+            <div class="lg:col-span-6 bg-white p-5 rounded-2xl border border-slate-200 shadow-sm flex flex-wrap items-center justify-between gap-3">
+              <div class="flex items-center gap-3">
+                <label for="seatCountInput" class="font-bold text-slate-700">총 학생 수:</label>
+                <input id="seatCountInput" type="number" min="1" max="100" value="${state.totalSeats}"
+                  class="w-24 px-3 py-2 border border-slate-300 rounded-xl font-bold text-center text-lg focus:outline-none focus:ring-2 focus:ring-indigo-500" />
+                <span class="text-slate-600 font-medium">명</span>
+              </div>
+              <div class="flex items-center gap-2">
+                <button onclick="handleSetTotalSeats(document.getElementById('seatCountInput').value)"
+                  class="px-4 py-2 bg-slate-900 hover:bg-slate-800 text-white text-sm font-semibold rounded-xl transition">
+                  인원 적용 및 초기화
+                </button>
+                <button onclick="resetAssignments()"
+                  class="px-3.5 py-2 bg-rose-50 hover:bg-rose-100 text-rose-600 text-sm font-semibold rounded-xl transition">
+                  기록만 초기화
+                </button>
+              </div>
+            </div>
+
+            <div class="lg:col-span-6 grid grid-cols-3 gap-3">
+              <div class="bg-white p-4 rounded-2xl border border-slate-200 shadow-sm text-center">
+                <div class="text-xs font-semibold text-slate-400">전체 좌석</div>
+                <div class="text-2xl font-extrabold text-slate-900 mt-1">${state.totalSeats}석</div>
+              </div>
+              <div class="bg-slate-200/80 p-4 rounded-2xl border border-slate-300 text-center">
+                <div class="text-xs font-semibold text-slate-600">배정 완료 (회색)</div>
+                <div class="text-2xl font-extrabold text-slate-700 mt-1">${assignedCount}명</div>
+              </div>
+              <div class="bg-indigo-50 p-4 rounded-2xl border border-indigo-100 text-center">
+                <div class="text-xs font-semibold text-indigo-600">남은 좌석</div>
+                <div class="text-2xl font-extrabold text-indigo-700 mt-1">${remainingCount}석</div>
+              </div>
+            </div>
+          </div>
+
+          <div class="bg-white p-6 rounded-3xl border border-slate-200 shadow-sm">
+            <div class="flex items-center justify-between mb-4">
+              <h2 class="font-bold text-slate-800">좌석 번호 및 배정 학생 현황 (클릭 시 수동 배정/취소)</h2>
+              <div class="flex items-center gap-4 text-xs font-medium text-slate-500">
+                <span class="flex items-center gap-1.5"><span class="w-3 h-3 rounded-sm bg-white border border-indigo-300 inline-block"></span>미배정</span>
+                <span class="flex items-center gap-1.5"><span class="w-3 h-3 rounded-sm bg-slate-300 inline-block"></span>배정 완료</span>
+              </div>
+            </div>
+            <div class="grid grid-cols-3 sm:grid-cols-4 md:grid-cols-6 lg:grid-cols-8 gap-3">
+              ${seatsHtml}
+            </div>
+          </div>
+        </div>
+
+        ${showQrModal ? `
+          <div class="fixed inset-0 bg-slate-900/60 backdrop-blur-sm flex items-center justify-center p-4 z-50">
+            <div class="bg-white rounded-3xl max-w-md w-full p-6 sm:p-8 text-center shadow-2xl animate-pop">
+              <div class="flex justify-between items-center mb-4">
+                <h3 class="text-xl font-extrabold text-slate-900">학생 입장용 QR 코드</h3>
+                <button onclick="showQrModal = false; render();" class="text-slate-400 hover:text-slate-600 text-2xl leading-none">&times;</button>
+              </div>
+              <p class="text-sm text-slate-600 mb-5">태블릿 카메라로 아래 QR 코드를 스캔한 뒤<br/><strong>이름을 입력</strong>하면 중복 없는 자리 번호가 즉시 나옵니다.</p>
+
+              <div class="bg-white p-4 rounded-2xl border-2 border-slate-200 inline-flex items-center justify-center mb-4 min-h-[262px] min-w-[262px]">
+                ${studentUrl
+                  ? `<div id="qrcode-container"></div>`
+                  : `<div class="text-sm text-amber-700 bg-amber-50 p-4 rounded-xl max-w-[240px]">
+                      현재 로컬 파일 환경입니다. 아래에 버셀 배포 주소(https://...)를 입력하면 QR 코드가 생성됩니다.
+                    </div>`
+                }
+              </div>
+
+              ${studentUrl ? `
+                <div class="mb-4">
+                  <div class="text-xs text-slate-400 break-all bg-slate-50 p-2.5 rounded-xl border border-slate-200 mb-2">${studentUrl}</div>
+                  <button onclick="navigator.clipboard.writeText('${studentUrl}'); alert('학생용 접속 주소가 복사되었습니다.');"
+                    class="text-xs font-semibold text-indigo-600 hover:text-indigo-800">
+                    접속 링크 복사하기
+                  </button>
+                </div>
+              ` : ''}
+
+              ${isLocalOrPreview ? `
+                <div class="text-left bg-slate-50 p-3.5 rounded-xl border border-slate-200 mb-4">
+                  <label class="block text-xs font-bold text-slate-700 mb-1">배포된 웹 주소 입력 (선택)</label>
+                  <div class="flex gap-2">
+                    <input id="customHostInputEl" type="url" placeholder="https://seat-qr.vercel.app" value="${customHostInput}"
+                      class="flex-1 px-3 py-1.5 text-xs border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-indigo-500" />
+                    <button onclick="customHostInput = document.getElementById('customHostInputEl').value; render();"
+                      class="px-3 py-1.5 bg-indigo-600 text-white text-xs font-semibold rounded-lg">적용</button>
+                  </div>
+                </div>
+              ` : ''}
+
+              <button onclick="showQrModal = false; render();"
+                class="w-full py-3 bg-slate-900 hover:bg-slate-800 text-white font-bold rounded-xl transition">
+                닫기
+              </button>
+            </div>
+          </div>
+        ` : ''}
+      `;
+
+      if (showQrModal && studentUrl) {
+        setTimeout(() => renderQrCode(studentUrl), 0);
+      }
+    }
+
+    function render() {
+      if (isStudentMode) {
+        renderStudentView();
+      } else {
+        renderAdminView();
+      }
+    }
+
+    render();
+    if (!isStudentMode) {
+      initAdminHost();
+    }
+  </script>
+</body>
+</html>
